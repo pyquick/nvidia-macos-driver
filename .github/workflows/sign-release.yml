@@ -58,7 +58,13 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
           security default-keychain -d user -s "$KEYCHAIN"
           rm -f "$RUNNER_TEMP/driver.p12"
-          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" | sed -n 's/.*"\(.*\)"/\1/p' | head -1)"
+          # -v asks for identities with a trusted chain; a self-signed signing certificate has no trust anchor, so it is
+          # absent from that list even though codesign can use it. List the policy's identities without -v, then fall
+          # back to any identity in the keychain if the certificate carries no code-signing EKU.
+          IDENTITY="$(security find-identity -p codesigning "$KEYCHAIN" | sed -n 's/.*"\(.*\)"/\1/p' | head -1)"
+          if [ -z "$IDENTITY" ]; then
+            IDENTITY="$(security find-identity "$KEYCHAIN" | sed -n 's/.*"\(.*\)"/\1/p' | head -1)"
+          fi
           if [ -z "$IDENTITY" ]; then
             echo "The P12 has no code-signing identity" >&2
             exit 1
