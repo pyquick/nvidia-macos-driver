@@ -210,7 +210,25 @@ static void nvmtl_m4_push_table(NVMTL4ArgumentTable *t, id enc, NVMTL4Stage st)
     if (!t || !enc) return;
     for (NSUInteger i = 0; i < t->_nb; i++) {
         if (t->_bk[i] == NVMTL4_KIND_NONE) continue;
-        if (t->_bk[i] == NVMTL4_KIND_HANDLE) {        // a resource ID in a buffer slot: the shader reads the 8-byte handle
+        if (t->_bk[i] == NVMTL4_KIND_HANDLE) {        // a resource ID in a buffer slot
+            // An acceleration structure's resource ID is its buffer's GPU address (NVMTLAccelerationStructure gpuResourceID).
+            // The shader parameter is a buffer, so the ID resolves back to the backing buffer and binds like setAddress:.
+            // Other resource IDs stay the opaque 8-byte handle the shader reads.
+            id<MTLBuffer> hb = nil; NSUInteger hoff = 0;
+            if (nvmtl_m4_resolve(t->_b[i], &hb, &hoff)) {
+                switch (st) {
+                    case NVMTL4_ST_COMPUTE: [(id<MTLComputeCommandEncoder>)enc setBuffer:hb offset:hoff atIndex:i]; break;
+                    case NVMTL4_ST_VERTEX:
+                        if (t->_hasStride[i]) [(id<MTLRenderCommandEncoder>)enc setVertexBuffer:hb offset:hoff attributeStride:t->_stride[i] atIndex:i];
+                        else [(id<MTLRenderCommandEncoder>)enc setVertexBuffer:hb offset:hoff atIndex:i];
+                        break;
+                    case NVMTL4_ST_FRAGMENT: [(id<MTLRenderCommandEncoder>)enc setFragmentBuffer:hb offset:hoff atIndex:i]; break;
+                    case NVMTL4_ST_OBJECT: [(id<MTLRenderCommandEncoder>)enc setObjectBuffer:hb offset:hoff atIndex:i]; break;
+                    case NVMTL4_ST_MESH: [(id<MTLRenderCommandEncoder>)enc setMeshBuffer:hb offset:hoff atIndex:i]; break;
+                    case NVMTL4_ST_TILE: [(id<MTLRenderCommandEncoder>)enc setTileBuffer:hb offset:hoff atIndex:i]; break;
+                }
+                continue;
+            }
             uint64_t h = t->_b[i];
             switch (st) {
                 case NVMTL4_ST_COMPUTE: [(id<MTLComputeCommandEncoder>)enc setBytes:&h length:8 atIndex:i]; break;
@@ -321,6 +339,79 @@ static NSSet<NSString *> *nvmtl_m4_blit_selectors(void)
     return s;
 }
 
+// MTL4 acceleration-structure descriptors carry GPU addresses; the Metal 3 build path takes buffers and offsets.
+static BOOL nvmtl_m4_range(MTL4BufferRange r, id<MTLBuffer> *buf, NSUInteger *off)
+{
+    if (!r.bufferAddress) return NO;
+    return nvmtl_m4_resolve(r.bufferAddress, buf, off) != 0;
+}
+
+static MTLAccelerationStructureGeometryDescriptor *nvmtl_m4_geometry(MTL4AccelerationStructureGeometryDescriptor *g)
+{
+    id<MTLBuffer> b = nil; NSUInteger o = 0;
+    if ([g isKindOfClass:[MTL4AccelerationStructureTriangleGeometryDescriptor class]]) {
+        MTL4AccelerationStructureTriangleGeometryDescriptor *s = (id)g;
+        if (!nvmtl_m4_range(s.vertexBuffer, &b, &o)) return nil;
+        MTLAccelerationStructureTriangleGeometryDescriptor *t = [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
+        t.vertexBuffer = b; t.vertexBufferOffset = o;
+        t.vertexFormat = s.vertexFormat; t.vertexStride = s.vertexStride; t.triangleCount = s.triangleCount;
+        if (s.indexBuffer.bufferAddress) {
+            if (!nvmtl_m4_range(s.indexBuffer, &b, &o)) return nil;
+            t.indexBuffer = b; t.indexBufferOffset = o; t.indexType = s.indexType;
+        }
+        if (s.transformationMatrixBuffer.bufferAddress) {
+            if (!nvmtl_m4_range(s.transformationMatrixBuffer, &b, &o)) return nil;
+            t.transformationMatrixBuffer = b; t.transformationMatrixBufferOffset = o; t.transformationMatrixLayout = s.transformationMatrixLayout;
+        }
+        t.intersectionFunctionTableOffset = s.intersectionFunctionTableOffset;
+        t.opaque = s.opaque;
+        t.allowDuplicateIntersectionFunctionInvocation = s.allowDuplicateIntersectionFunctionInvocation;
+        return t;
+    }
+    if ([g isKindOfClass:[MTL4AccelerationStructureBoundingBoxGeometryDescriptor class]]) {
+        MTL4AccelerationStructureBoundingBoxGeometryDescriptor *s = (id)g;
+        if (!nvmtl_m4_range(s.boundingBoxBuffer, &b, &o)) return nil;
+        MTLAccelerationStructureBoundingBoxGeometryDescriptor *t = [MTLAccelerationStructureBoundingBoxGeometryDescriptor descriptor];
+        t.boundingBoxBuffer = b; t.boundingBoxBufferOffset = o;
+        t.boundingBoxStride = s.boundingBoxStride; t.boundingBoxCount = s.boundingBoxCount;
+        t.intersectionFunctionTableOffset = s.intersectionFunctionTableOffset;
+        t.opaque = s.opaque;
+        t.allowDuplicateIntersectionFunctionInvocation = s.allowDuplicateIntersectionFunctionInvocation;
+        return t;
+    }
+    return nil;
+}
+
+API_AVAILABLE(macos(26.0)) MTLAccelerationStructureDescriptor *nvmtl_m4_as_descriptor(MTL4AccelerationStructureDescriptor *d)
+{
+    if ([d isKindOfClass:[MTL4PrimitiveAccelerationStructureDescriptor class]]) {
+        MTL4PrimitiveAccelerationStructureDescriptor *p = (id)d;
+        if (p.motionKeyframeCount > 1) return nil;
+        NSMutableArray *gs = [NSMutableArray array];
+        for (MTL4AccelerationStructureGeometryDescriptor *g in p.geometryDescriptors) {
+            MTLAccelerationStructureGeometryDescriptor *t = nvmtl_m4_geometry(g);
+            if (!t) return nil;
+            [gs addObject:t];
+        }
+        MTLPrimitiveAccelerationStructureDescriptor *r = [MTLPrimitiveAccelerationStructureDescriptor descriptor];
+        r.geometryDescriptors = gs;
+        return r;
+    }
+    if ([d isKindOfClass:[MTL4InstanceAccelerationStructureDescriptor class]]) {
+        MTL4InstanceAccelerationStructureDescriptor *s = (id)d;
+        if (s.motionTransformCount) return nil;
+        id<MTLBuffer> b = nil; NSUInteger o = 0;
+        if (!nvmtl_m4_range(s.instanceDescriptorBuffer, &b, &o)) return nil;
+        MTLInstanceAccelerationStructureDescriptor *r = [MTLInstanceAccelerationStructureDescriptor descriptor];
+        r.instanceDescriptorBuffer = b; r.instanceDescriptorBufferOffset = o;
+        r.instanceDescriptorStride = s.instanceDescriptorStride;
+        r.instanceCount = s.instanceCount;
+        r.instanceDescriptorType = s.instanceDescriptorType;
+        return r;
+    }
+    return nil;
+}
+
 @implementation NVMTL4ComputeEncoder
 - (instancetype)initWithCommandBuffer:(NVMTL4CommandBuffer *)cb { if ((self = [super init])) { _cb = cb; _tg = [NSMutableDictionary new]; } return self; }
 - (id<MTL4CommandBuffer>)commandBuffer { return _cb; }
@@ -388,7 +479,19 @@ static NSSet<NSString *> *nvmtl_m4_blit_selectors(void)
     if (![(id)h isKindOfClass:[NVMTL4CounterHeap class]]) { nvlog("Metal 4: writeTimestamp into a heap this device did not make - dropped"); return; }
     [self nvmtlPush]; [(id<MTLComputeCommandEncoder>)_enc sampleCountersInBuffer:((NVMTL4CounterHeap *)h)->_sb atSampleIndex:i withBarrier:g == MTL4TimestampGranularityPrecise];
 }
-- (void)buildAccelerationStructure:(id<MTLAccelerationStructure>)a descriptor:(MTL4AccelerationStructureDescriptor *)d scratchBuffer:(MTL4BufferRange)s { nvlog("Metal 4: MTL4 acceleration structure builds are not implemented"); }
+- (void)buildAccelerationStructure:(id<MTLAccelerationStructure>)a descriptor:(MTL4AccelerationStructureDescriptor *)d scratchBuffer:(MTL4BufferRange)s {
+    if (!a || !d) { nvlog("Metal 4: buildAccelerationStructure: nil structure or descriptor"); return; }
+    id<MTLBuffer> sc = nil; NSUInteger soff = 0;
+    if (!nvmtl_m4_range(s, &sc, &soff)) { nvlog("Metal 4: buildAccelerationStructure: the scratch address is not a known buffer"); return; }
+    MTLAccelerationStructureDescriptor *d3 = nvmtl_m4_as_descriptor(d);
+    if (!d3) { nvlog("Metal 4: buildAccelerationStructure: %s is not carried (triangles, boxes and indirect instances are)", NSStringFromClass([d class]).UTF8String); return; }
+    // Close the compute/blit encoder this Metal 4 encoder has open, so the build is ordered after what it recorded.
+    [self nvmtlCloseUnderlying];
+    id<MTLAccelerationStructureCommandEncoder> ae = [_cb->_u accelerationStructureCommandEncoder];
+    if (!ae) { nvlog("Metal 4: buildAccelerationStructure: no Metal 3 acceleration-structure encoder"); return; }
+    [ae buildAccelerationStructure:a descriptor:d3 scratchBuffer:sc scratchBufferOffset:soff];
+    [ae endEncoding];
+}
 - (void)endEncoding { if (_ended) return; _ended = YES; [self nvmtlCloseUnderlying]; _cb->_openEnc = nil; }
 - (void)dealloc { if (!_ended) [self nvmtlCloseUnderlying]; }
 @end
@@ -561,9 +664,16 @@ API_AVAILABLE(macos(26.0))
 - (CFTimeInterval)GPUEndTime { return _t1; }
 @end
 
-// MTL4CommitOptions keeps its handlers in a private ivar; read them through the public selector we also wrap.
+// MTL4CommitOptions keeps its handlers in a private ivar. macOS 26 ships two shapes under it: a plain array of blocks,
+// and on the 26.7 builds measured here one _MTL4CommitFeedbackDispatch object that owns a C++ vector of the blocks and
+// runs them from -executeBlocksWithCommitFeedback:. That object is not a block; calling it as one jumps into its isa
+// and the process dies with a SIGBUS on the first commit (an empty command buffer is enough).
+@interface NSObject (NVMTL4FeedbackDispatch)
+- (void)executeBlocksWithCommitFeedback:(id<MTL4CommitFeedback>)feedback;
+@end
+
 API_AVAILABLE(macos(26.0))
-static NSArray *nvmtl_m4_feedback_handlers(MTL4CommitOptions *o)
+static id nvmtl_m4_feedback_target(MTL4CommitOptions *o)
 {
     if (!o) return nil;
     static Ivar iv; static dispatch_once_t once;
@@ -573,11 +683,19 @@ static NSArray *nvmtl_m4_feedback_handlers(MTL4CommitOptions *o)
         free(l);
         if (!iv) nvlog("Metal 4: MTL4CommitOptions has no handler ivar this driver recognises - commit feedback handlers will not run");
     });
-    if (!iv) return nil;
-    id v = object_getIvar(o, iv);
-    if ([v isKindOfClass:[NSArray class]]) return v;
-    if (v) return @[v];
-    return nil;
+    return iv ? object_getIvar(o, iv) : nil;
+}
+
+static void nvmtl_m4_run_feedback(id target, id<MTL4CommitFeedback> fb)
+{
+    if (!target) return;
+    if ([target respondsToSelector:@selector(executeBlocksWithCommitFeedback:)]) {
+        [(id)target executeBlocksWithCommitFeedback:fb];
+    } else if ([target isKindOfClass:[NSArray class]]) {
+        for (id h in (NSArray *)target) if (h) ((MTL4CommitFeedbackHandler)h)(fb);
+    } else {
+        ((MTL4CommitFeedbackHandler)target)(fb);
+    }
 }
 
 // ---- queue --------------------------------------------------------------------------------------------------------------
@@ -588,7 +706,7 @@ API_AVAILABLE(macos(26.0))
 - (NSString *)label { return _label; }
 - (void)commit:(const id<MTL4CommandBuffer> __unsafe_unretained [])cbs count:(NSUInteger)n { [self commit:cbs count:n options:[MTL4CommitOptions new]]; }
 - (void)commit:(const id<MTL4CommandBuffer> __unsafe_unretained [])cbs count:(NSUInteger)n options:(MTL4CommitOptions *)options {
-    NSArray *handlers = nvmtl_m4_feedback_handlers(options);
+    id feedback = nvmtl_m4_feedback_target(options);
     for (NSUInteger i = 0; i < n; i++) {
         NVMTL4CommandBuffer *c = (NVMTL4CommandBuffer *)cbs[i];
         if (![c isKindOfClass:[NVMTL4CommandBuffer class]]) { nvlog("Metal 4: commit: a command buffer that is not this driver's - skipped"); continue; }
@@ -600,9 +718,9 @@ API_AVAILABLE(macos(26.0))
         dispatch_queue_t fq = _fb ?: dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
         [u addCompletedHandler:^(id<MTLCommandBuffer> done) {
             (void)sets;
-            if (!(last && handlers.count)) return;
+            if (!(last && feedback)) return;
             NVMTL4Feedback *fb = [NVMTL4Feedback new]; fb->_err = done.error; fb->_t0 = done.GPUStartTime; fb->_t1 = done.GPUEndTime;
-            dispatch_async(fq, ^{ for (id h in handlers) ((MTL4CommitFeedbackHandler)h)(fb); });
+            dispatch_async(fq, ^{ nvmtl_m4_run_feedback(feedback, fb); });
         }];
         c->_committed = YES; c->_u = nil; c->_begun = NO;                   // a later begin starts a fresh recording
         [u commit];

@@ -2849,8 +2849,17 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
 
 - (BOOL)supportsRaytracing { const BOOL y = nvmtl_vk_rt_available() != 0; static int said; if (!said++) nvlog("QUERY supportsRaytracing -> %s", y ? "YES" : "NO"); return y; }
 - (BOOL)supportsRaytracingFromRender { const BOOL y = nvmtl_vk_rt_available() != 0; static int said; if (!said++) nvlog("QUERY supportsRaytracingFromRender -> %s", y ? "YES" : "NO"); return y; }
+API_AVAILABLE(macos(26.0)) MTLAccelerationStructureDescriptor *nvmtl_m4_as_descriptor(MTL4AccelerationStructureDescriptor *d);
 - (MTLAccelerationStructureSizes)accelerationStructureSizesWithDescriptor:(MTLAccelerationStructureDescriptor *)desc {
     MTLAccelerationStructureSizes s = { 0, 0, 0 };
+    // A Metal 4 descriptor carries GPU addresses; convert it to the Metal 3 shape both the size query and the build read.
+    if (@available(macOS 26.0, *)) {
+        if ([desc isKindOfClass:[MTL4AccelerationStructureDescriptor class]]) {
+            MTLAccelerationStructureDescriptor *c = nvmtl_m4_as_descriptor((MTL4AccelerationStructureDescriptor *)desc);
+            if (!c) { nvlog("accelerationStructureSizesWithDescriptor: a Metal 4 descriptor this driver cannot carry"); return s; }
+            desc = c;
+        }
+    }
     // One per thread: these are filled from the descriptor and read by the build, and the game
     // encodes from nine threads at once. Shared, two builds in flight overwrite each other's
     // geometry and a structure gets built from another mesh.

@@ -1,0 +1,101 @@
+--- a/src/nouveau/compiler/nak/from_nir.rs
++++ b/src/nouveau/compiler/nak/from_nir.rs
+@@ -3364,7 +3364,19 @@
+             nir_intrinsic_load_global_nv => {
+                 let size_B =
+                     (intrin.def.bit_size() / 8) * intrin.def.num_components();
+-                assert!(u32::from(size_B) <= intrin.align());
++                // A load wider than the alignment NIR promises cannot be one instruction: LDG.B128 needs 16-byte
++                // alignment, and the AS encoder reads vec4 fields of scalar-layout structs at an alignment of 4.
++                // Split such a load into naturally aligned pieces instead of refusing the shader. A load narrower
++                // than 4 bytes cannot be split any further.
++                let align = intrin.align();
++                assert!(
++                    size_B == 1 || size_B == 2 || size_B % 4 == 0,
++                    "global load of {size_B} bytes is not a whole number of 32-bit components"
++                );
++                assert!(
++                    u32::from(size_B) <= align || align >= 4,
++                    "unaligned global load of {size_B} bytes with alignment {align}"
++                );
+                 // item 5 nak weak: see patch_nak_weak.py - plain loads are L1-cached weak loads like NVIDIA's.
+                 static STRONG_LOADS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                 let strong_loads = *STRONG_LOADS.get_or_init(|| {
+@@ -3380,8 +3392,8 @@
+                 } else {
+                     MemOrder::Strong(MemScope::GPU)
+                 };
+-                let access = MemAccess {
+-                    mem_type: MemType::from_size(size_B, false),
++                let mut access = MemAccess {
++                    mem_type: MemType::B32,
+                     space: MemSpace::Global(MemAddrType::A64),
+                     order: order,
+                     eviction_priority: self
+@@ -3390,17 +3402,55 @@
+                 let addr = self.get_src(&srcs[0]);
+                 let uaddr = self.get_src(&srcs[1]);
+                 let pred = self.get_src(&srcs[2]);
+-                let dst = b.alloc_ssa_vec(RegFile::GPR, size_B.div_ceil(4));
+-
+-                b.push_op(OpLd {
+-                    dst: dst.clone().into(),
+-                    addr: addr,
+-                    uniform_addr: uaddr,
+-                    pred: pred,
+-                    offset: intrin.base(),
+-                    stride: OffsetStride::X1,
+-                    access: access,
+-                });
++                let encodable = matches!(size_B, 1 | 2 | 4 | 8 | 16);
++                let dst = if encodable && u32::from(size_B) <= align {
++                    access.mem_type = MemType::from_size(size_B, false);
++                    let dst = b.alloc_ssa_vec(RegFile::GPR, size_B.div_ceil(4));
++                    b.push_op(OpLd {
++                        dst: dst.clone().into(),
++                        addr: addr,
++                        uniform_addr: uaddr,
++                        pred: pred,
++                        offset: intrin.base(),
++                        stride: OffsetStride::X1,
++                        access: access,
++                    });
++                    dst
++                } else {
++                    if std::env::var_os("NVK_LOG_UNALIGNED_LOAD").is_some() {
++                        eprintln!(
++                            "nak: splitting a {size_B}-byte global load at alignment {align} (offset {})",
++                            intrin.base()
++                        );
++                    }
++                    let total = u32::from(size_B);
++                    let mut comps: Vec<SSAValue> = Vec::with_capacity(size_B.div_ceil(4) as usize);
++                    let mut done: u32 = 0;
++                    while done < total {
++                        let left = total - done;
++                        let chunk = if left >= 16 && align >= 16 {
++                            16
++                        } else if left >= 8 && align >= 8 {
++                            8
++                        } else {
++                            4
++                        };
++                        access.mem_type = MemType::from_size(chunk as u8, false);
++                        let part = b.alloc_ssa_vec(RegFile::GPR, (chunk / 4) as u8);
++                        b.push_op(OpLd {
++                            dst: part.clone().into(),
++                            addr: addr.clone(),
++                            uniform_addr: uaddr.clone(),
++                            pred: pred.clone(),
++                            offset: intrin.base() + done as i32,
++                            stride: OffsetStride::X1,
++                            access: access.clone(),
++                        });
++                        comps.extend_from_slice(&part);
++                        done += chunk;
++                    }
++                    SSARef::try_from(comps).expect("a split global load has at least one component")
++                };
+                 self.set_dst(&intrin.def, dst);
+             }
+             nir_intrinsic_ldtram_nv => {

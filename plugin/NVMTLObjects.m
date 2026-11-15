@@ -8551,7 +8551,14 @@ uint32_t nvmtl_geoms_from_descriptor(id desc, nvmtl_geom *out, uint32_t max, int
 @implementation NVMTLAccelerationStructure
 - (NSUInteger)size { return _b.size; }
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)s { return MTLPurgeableStateNonVolatile; }
-- (MTLResourceID)gpuResourceID { MTLResourceID r; r._impl = _as.addr ? _as.addr : nvmtl_vk_buffer_address(&_b); return r; }
+- (MTLResourceID)gpuResourceID {
+    MTLResourceID r; r._impl = _as.addr ? _as.addr : nvmtl_vk_buffer_address(&_b);
+    // A Metal 4 argument table binds a resource ID as a buffer address; note the backing range so setResource: can
+    // resolve the ID back to this structure's buffer (the same binding setAccelerationStructure:atBufferIndex: makes).
+    extern void nvmtl_m4_note_buffer(id, uint64_t, uint64_t);
+    if (r._impl) nvmtl_m4_note_buffer(self, r._impl, _b.size);
+    return r;
+}
 - (BOOL)nvmtlEnsureCreated:(int)instance {
     if (_as.as) {
         if (_as.instance != instance) { nvlog("acceleration structure: built as %s before, now as %s — REFUSED", _as.instance ? "instances" : "primitives", instance ? "instances" : "primitives"); return NO; }

@@ -2627,7 +2627,7 @@ fn canonicalize_local_field_addresses_in(f: &mut FuncBlock, named: &HashMap<Stri
         let derived = if let Some(cast) = rest.strip_prefix("bitcast ptr ") {
             let Some(base) = cast.strip_suffix(" to ptr").map(str::trim) else { continue };
             let Some(base) = addrs.get(base) else { continue };
-            if base.path.is_empty() {
+            if base.path.is_empty() && !pointer_access_only(&f.body, name) {
                 continue; // the object itself, as lifetime markers take it
             }
             Addr { root: base.root.clone(), root_ty: base.root_ty.clone(), path: base.path.clone(), ty: base.ty.clone(), inbounds: base.inbounds }
