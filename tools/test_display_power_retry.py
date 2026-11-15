@@ -18,8 +18,10 @@ assert 'return kIOReturnSuccess' in connection_power and 'setHeadPower' not in c
 fixture = r'''
 #include <cassert>
 #include <cstdio>
+#include <cstdint>
 #include <mutex>
 using IOReturn=int;
+using thread_call_t=void*;
 struct IOService {};
 enum { kIOPMAckImplied=0, kIOFBNotifyDidPowerOn=1, kIOFBNotifyWillPowerOff=2 };
 static bool disabled=false, lockAvailable=true;
@@ -36,7 +38,9 @@ static int OSAddAtomic(int n,int *value) { int old=*value;*value+=n;return old; 
 struct NVRMNVDAFramebuffer {
     bool fHeadSlept=false, fModeSet=true, sleepOK=true, wakeOK=true;
     bool fPowerOn=true, pagingState=true, fSysSlept=false, gpuReady=true;
-    unsigned familyWakes=0;
+    unsigned familyWakes=0, wakeRetries=0;
+    thread_call_t fGpuWake=nullptr;
+    void scheduleCall(thread_call_t call, uint64_t deadline) { (void)deadline; if (call == fGpuWake) wakeRetries++; }
     void *fSurf=this;
     unsigned fHead=0, sleeps=0, wakes=0, notifications=0, audioPublishes=0;
     void publishDisplayAudioProperties() { audioPublishes++; }
@@ -59,9 +63,10 @@ int main() {
     f.sleepOK=false; assert(!f.setHeadPower(false) && !f.fHeadSlept);
     f.sleepOK=true; assert(f.setHeadPower(false) && f.fHeadSlept);
     unsigned sleeps=f.sleeps; assert(f.setHeadPower(false) && f.sleeps==sleeps);
+    f.fGpuWake=(thread_call_t)1; unsigned retries=f.wakeRetries;
     f.wakeOK=false; f.setPowerState(1,nullptr);
-    // a failed wake stays retryable, and WindowServer is still told the display is on (1.14.7 behaviour)
-    assert(f.fHeadSlept && f.wakes==1 && f.notifications==1);
+    // a failed wake stays retryable, queues the GPU wake call, and WindowServer is still told the display is on (1.14.7 behaviour)
+    assert(f.fHeadSlept && f.wakes==1 && f.notifications==1 && f.wakeRetries==retries+1);
     // the display's audio is published again only once the head really is back (PR #366)
     assert(f.audioPublishes==0);
     f.wakeOK=true; f.setPowerState(1,nullptr);
