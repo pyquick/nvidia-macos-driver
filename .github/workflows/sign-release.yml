@@ -77,32 +77,16 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/download" "$RUNNER_TEMP/tree"
-          pick_asset() {
-            find "$RUNNER_TEMP/download" -type f -name 'nullmoth-nvidia-*.tar.gz' ! -name '*-signed.tar.gz' | head -1
-          }
-          download_asset() {
-            gh release download "$1" --repo "$2" --pattern 'nullmoth-nvidia-*.tar.gz' --dir "$RUNNER_TEMP/download" 2>/dev/null
-          }
-          ASSET=""; SOURCE=""
-          if download_asset "$RELEASE_TAG" "$GITHUB_REPOSITORY"; then
-            ASSET="$(pick_asset)"; [ -z "$ASSET" ] || SOURCE="$GITHUB_REPOSITORY@$RELEASE_TAG"
-          fi
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'nullmoth-nvidia-*.tar.gz' --dir "$RUNNER_TEMP/download" 2>/dev/null || true
+          ASSET="$(find "$RUNNER_TEMP/download" -type f -name 'nullmoth-nvidia-*.tar.gz' ! -name '*-signed.tar.gz' | head -1)"
           if [ -z "$ASSET" ]; then
-            # A release in the fork can be published before the driver archive is attached (or hold only a signed
-            # package). The driver product itself lives upstream, so use that release's archive in that case.
-            for tag in "$RELEASE_TAG" "v${RELEASE_TAG#v}"; do
-              if download_asset "$tag" "nullmoth/nvidia-macos-driver"; then
-                ASSET="$(pick_asset)"
-                if [ -n "$ASSET" ]; then SOURCE="nullmoth/nvidia-macos-driver@$tag"; break; fi
-              fi
-            done
-          fi
-          if [ -z "$ASSET" ]; then
-            echo "No nullmoth-nvidia-*.tar.gz asset in $GITHUB_REPOSITORY@$RELEASE_TAG or the upstream release" >&2
+            echo "No self-built nullmoth-nvidia-*.tar.gz in $GITHUB_REPOSITORY@$RELEASE_TAG." >&2
+            echo "This workflow does not download nullmoth's release: build the package from this checkout and attach it." >&2
             gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' || true
             exit 1
           fi
-          echo "Signing $ASSET from $SOURCE"
+          echo "Signing $ASSET from $GITHUB_REPOSITORY@$RELEASE_TAG"
           tar -xzf "$ASSET" -C "$RUNNER_TEMP/tree"
           if [ -d "$RUNNER_TEMP/tree/pkgroot" ]; then
             ROOT="$RUNNER_TEMP/tree/pkgroot"; TOP=pkgroot; BASE_DIR="$RUNNER_TEMP/tree"
