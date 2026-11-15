@@ -1,0 +1,103 @@
+# Sign a published driver release with the project's own P12. The certificate is used for code signing only; there is no
+# notarization step. The original asset is left untouched: the signed package is uploaded beside it as
+# <name>-signed.tar.gz, so a release can be compared before it is offered to users.
+name: Sign driver release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to sign (for example v3.0)
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  sign:
+    runs-on: macos-15-intel
+    timeout-minutes: 90
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Check out the signing tools
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Read the release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG='${{ github.event.release.tag_name || inputs.tag }}'
+          [ -n "$TAG" ] || { echo "A release tag is required" >&2; exit 1; }
+          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: Import the code-signing certificate
+        shell: bash
+        env:
+          P12_BASE64: ${{ secrets.HACKDOC_P12_base64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${P12_BASE64:-}" ] || [ -z "${P12_PASSWORD:-}" ]; then
+            echo "Missing repository secrets HACKDOC_P12_base64 and/or P12_PASSWORD" >&2
+            exit 1
+          fi
+          KEYCHAIN="$RUNNER_TEMP/driver-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          printf '%s' "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/driver.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/driver.p12" -k "$KEYCHAIN" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security default-keychain -d user -s "$KEYCHAIN"
+          rm -f "$RUNNER_TEMP/driver.p12"
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" | sed -n 's/.*"\(.*\)"/\1/p' | head -1)"
+          if [ -z "$IDENTITY" ]; then
+            echo "The P12 has no code-signing identity" >&2
+            exit 1
+          fi
+          echo "Signing as: $IDENTITY"
+          echo "CODESIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+
+      - name: Download, sign, verify, and repack the driver archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/download" "$RUNNER_TEMP/tree"
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'nullmoth-nvidia-*.tar.gz' --dir "$RUNNER_TEMP/download"
+          ASSET="$(find "$RUNNER_TEMP/download" -type f -name 'nullmoth-nvidia-*.tar.gz' ! -name '*-signed.tar.gz' | head -1)"
+          [ -n "$ASSET" ] || { echo "The release has no nullmoth-nvidia-*.tar.gz asset" >&2; exit 1; }
+          tar -xzf "$ASSET" -C "$RUNNER_TEMP/tree"
+          if [ -d "$RUNNER_TEMP/tree/pkgroot" ]; then
+            ROOT="$RUNNER_TEMP/tree/pkgroot"; TOP=pkgroot; BASE_DIR="$RUNNER_TEMP/tree"
+          else
+            ROOT="$RUNNER_TEMP/tree"; TOP=.; BASE_DIR="$ROOT"
+          fi
+          CODESIGN_IDENTITY="$CODESIGN_IDENTITY" bash package/sign_package.sh "$ROOT"
+          BASE="$(basename "$ASSET" .tar.gz)"
+          SIGNED="$BASE-signed.tar.gz"
+          if [ "$TOP" = . ]; then
+            tar -czf "$SIGNED" -C "$ROOT" .
+          else
+            tar -czf "$SIGNED" -C "$BASE_DIR" "$TOP"
+          fi
+          shasum -a 256 "$SIGNED" > "$SIGNED.sha256"
+          gh release upload "$RELEASE_TAG" "$SIGNED" "$SIGNED.sha256" --clobber
+
+      - name: Keep the signed package as a workflow artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: signed-driver
+          path: |
+            *-signed.tar.gz
+            *-signed.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7

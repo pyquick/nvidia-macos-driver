@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import os
 import plistlib
 import shutil
 import subprocess
@@ -60,6 +61,7 @@ def files(root, allowed_links=None):
 def assemble(archive, output):
     overlay = Path(__file__).resolve().parent
     identity = json.loads((overlay / 'RELEASE-IDENTITY.json').read_text())
+    sign_identity = os.environ.get('CODESIGN_IDENTITY', '-')
     payload = overlay / 'payload'
     if digest(archive) != BASE_SHA256:
         raise ValueError('Download the official v2.9 archive and verify its SHA-256.')
@@ -84,9 +86,10 @@ def assemble(archive, output):
         nvrm_plist.write_bytes(plistlib.dumps(nvrm_info, sort_keys=False))
         run('/usr/bin/xattr', '-cr', str(root))
         for name in ('libnvencvt.dylib', 'libnvencvt-loader.dylib'):
-            run('/usr/bin/codesign', '--force', '--sign', '-', str(root / PLUGIN / 'Contents/MacOS' / name))
-        for path in (NVRM, PLUGIN):
-            run('/usr/bin/codesign', '--force', '--sign', '-', str(root / path))
+            run('/usr/bin/codesign', '--force', '--timestamp=none', '--sign', sign_identity,
+                str(root / PLUGIN / 'Contents/MacOS' / name))
+        for path in (NVRM, FRAMEBUFFER, PLUGIN):
+            run('/usr/bin/codesign', '--force', '--timestamp=none', '--sign', sign_identity, str(root / path))
         for path in (NVRM, FRAMEBUFFER, PLUGIN):
             run('/usr/bin/codesign', '--verify', '--deep', '--strict', str(root / path))
         original = root / 'BASELINE-IDENTITY.json'
