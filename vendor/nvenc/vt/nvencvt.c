@@ -1210,6 +1210,21 @@ static void load_conf(void)
     fclose(f);
 }
 
+// A launched browser can pass the injection environment to every child. Scope codec registration
+// to the named media processes, even when the codec library is injected directly.
+static bool injected_here(void)
+{
+    const char *only = getenv("NVENCVT_INJECT_ONLY");
+    if (!only || !*only) return true;
+    const char *process = getprogname();
+    if (!process) return false;
+    char list[512], *save = NULL;
+    snprintf(list, sizeof list, "%s", only);
+    for (const char *name = strtok_r(list, ", :", &save); name; name = strtok_r(NULL, ", :", &save))
+        if (!strcmp(name, process)) return true;
+    return false;
+}
+
 __attribute__((constructor)) static void init(void)
 {
     load_conf();
@@ -1221,6 +1236,11 @@ __attribute__((constructor)) static void init(void)
         if ((gLogF = nvencvt_out(p, "a"))) gLog = true;
     }
     const char *ins = getenv("DYLD_INSERT_LIBRARIES");
-    if (ins && strstr(ins, "nvencvt") && !getenv("NVENCVT_NO_REGISTER"))
-        NVEncVT_Register(getenv("NVENCVT_RATING") ? atoi(getenv("NVENCVT_RATING")) : 1100);
+    if (ins && strstr(ins, "nvencvt") && !getenv("NVENCVT_NO_REGISTER") && injected_here()) {
+        const char *configured = getenv("NVENCVT_RATING");
+        const int rating = configured ? atoi(configured) : 1100;
+        const char *decodersOnly = getenv("NVENCVT_INJECT_DECODERS_ONLY");
+        if (decodersOnly && !strcmp(decodersOnly, "1")) NVEncVT_RegisterDecoders(rating);
+        else NVEncVT_Register(rating);
+    }
 }

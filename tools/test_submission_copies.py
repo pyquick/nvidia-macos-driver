@@ -32,7 +32,7 @@ typedef struct { void *map; size_t size; } Buffer;
 @implementation NVMTLBuffer @end
 @interface NVMTLTexture : NSObject { @public
     NVMTLBuffer *_backBuf; NVMTLTexture *_parent; MTLTextureUsage _usage;
-    IOSurfaceRef _surf; NSUInteger _plane; BOOL _vramOn; int _tag;
+    IOSurfaceRef _surf; NSUInteger _plane; BOOL _vramOn, _vramMulti; int _tag;
 } @end
 @implementation NVMTLTexture @end
 // a used heap's pin (NVMTLObjects.m): its members with a host copy; none in these fixtures
@@ -121,7 +121,7 @@ submission_fixture = r"""
 typedef struct { void *cb; } Commands;
 typedef struct { int unused; } nvmtl_inflight;
 @interface NVMTLSubmissionPart : NSObject { @public
-    Commands commands; NSSet *resources; NSArray *surfaces, *scratch, *signals;
+    Commands commands; NSSet *resources; NSSet *copiedSurfaces; NSArray *surfaces, *scratch, *signals;
     id waitEvent, signalEvent; uint64_t value;
     BOOL waitFolded, aheadEmpty, claimed; int aheadFailed; unsigned encoders;
     nvmtl_inflight *inflight;
@@ -131,11 +131,13 @@ typedef struct { int unused; } nvmtl_inflight;
 @interface NVMTLTexture (Publication)
 - (BOOL)nvmtlSurfaceOut;
 - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied;
+- (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied copied:(BOOL)copied;
 @end
 // every publication is logged in events as "o<tag>:<dirtied>" (dirtied: the commit's VRAM mark stands, nothing is asked
 // of the kernel again)
 @implementation NVMTLTexture (Publication)
 - (BOOL)nvmtlSurfaceOut { return [self nvmtlSurfaceOutDirtied:NO]; }
+- (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied copied:(BOOL)copied { (void)copied; return [self nvmtlSurfaceOutDirtied:dirtied]; }
 - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied { if (events) [events addObject:[NSString stringWithFormat:@"o%d:%d",_tag,(int)dirtied]]; return YES; }
 @end
 @interface NVMTLCommandBuffer : NSObject { @public
@@ -149,6 +151,7 @@ typedef struct { int unused; } nvmtl_inflight;
 - (void)nvmtlFinishExecution:(NSError *)error;
 @end
 static _Atomic unsigned long long gsub_inflight, gsub_peak, gsub_ahead, gEvFold, gEvFoldEmpty, gSkipEmpty;
+static void nvmtl_ws_gpu_copyout(NVMTLCommandBuffer *cb) { (void)cb; }
 static NSMutableArray *nvmtl_quarantined_parts;
 static unsigned begins, waits, finishes, scheduled;
 static int submitResult; static BOOL allocationFails;

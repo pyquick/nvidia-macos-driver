@@ -62,7 +62,7 @@ while IFS= read -r -d '' f; do
   done < <(otool -L "$f" 2>/dev/null | awk 'NR>1 {print $1}')
 done < <(find "$ROOT" -type f -print0)
 HERE=$(cd "$(dirname "$0")" && pwd)
-# Every kext names the IOKit families it imports from, or it never loads (build/check_kext_libraries.sh).
+# Check the imported IOKit families and known unavailable compiler-generated symbols.
 while IFS= read -r -d '' k; do
   n=$(basename "$k" .kext)
   head -c 4 "$k/Contents/MacOS/$n" 2>/dev/null | od -An -tx1 | tr -d ' \n' | grep -qE '^(cffaedfe|cafebabe)$' || continue   # a test tree's stand-in

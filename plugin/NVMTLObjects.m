@@ -8,6 +8,7 @@
 #include "nvmtl_format_twin.h"
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#include "nvmtl_reader_skip.h"
 
 void nvlog(const char *fmt, ...);
 void nvlog_every(const char *fmt, ...);   // a periodic census line, never dropped by the repeat limiter
@@ -237,6 +238,13 @@ static void nvmtl_conf_settle(void)
     nvmtl_profile_ctx ctx = { p, 0 };
     for (unsigned i = 0; p && i < p->nknobs && i < 64; i++) if (getenv(p->knobs[i].key)) ctx.envBits |= 1ull << i;
     nvmtl_conf_read_file(forgot);
+    // Dock tiles, Dock shortcut menus and AppKit's window controls can lose their
+    // GPU channels on the first asynchronous NVK surface upload.
+    if ((!strcmp(me, "com.apple.dock.extra") && !strcmp(bid, "com.apple.dock.extra")) ||
+        (!strcmp(me, "DockHelper") && !strcmp(bid, "com.apple.dock.helper")) ||
+        (!strcmp(me, "ThemeWidgetControlViewService") &&
+         !strcmp(bid, "com.apple.appkit.xpc.ThemeWidgetControlViewService")))
+        setenv("NVRM_ASYNC", "0", 0);
     nvmtl_os_version_override(me, bid);
     if (p && !nvmtl_app_profile_for(me, bid, getenv("NVMTL_APP_PROFILE"))) {
         nvlog("profile: %s: off (NVMTL_APP_PROFILE=0)", me);
@@ -1265,7 +1273,7 @@ static void nvmtl_nonzero(const void *base, size_t row, size_t rowValid, uint32_
 // Keep all partial updates, views, arrays, volumes, compressed and multisample images
 // on SurfaceIn: their untouched bytes still have to be preserved.
 static BOOL nvmtl_surface_full_overwrite(NVMTLTexture *t, MTLRegion r, NSUInteger level, NSUInteger slice) {
-    if (!t || !t->_surf || t->_parent || t->_viewParent || t->_tbView || t->_baseLevel || t->_baseSlice || level || slice)
+    if (!t || !t->_surf || t->_vramMulti || t->_parent || t->_viewParent || t->_tbView || t->_baseLevel || t->_baseSlice || level || slice)
         return NO;
     const nvk_image *i = &t->_i;
     if (i->bpp != 4 || (t->_fmt != MTLPixelFormatBGRA8Unorm && t->_fmt != MTLPixelFormatBGRA8Unorm_sRGB
@@ -1274,6 +1282,7 @@ static BOOL nvmtl_surface_full_overwrite(NVMTLTexture *t, MTLRegion r, NSUIntege
         && i->bw <= 1 && i->bh <= 1 && !r.origin.x && !r.origin.y && !r.origin.z
         && r.size.width == i->w && r.size.height == i->h && r.size.depth == 1;
 }
+static id nvmtl_surface_sync(NVMTLTexture *t);
 // A recorded overwrite only defines contents for subsequent commands in this
 // command buffer. Do not promote global Seed/generation state before it executes:
 // an abandoned command buffer must leave SurfaceIn able to restore CPU contents.
@@ -1281,19 +1290,30 @@ static void nvmtl_surface_overwrite_recorded(NVMTLCommandBuffer *cb, NVMTLTextur
     if (!cb || !t) return;
     NVMTLTexture *r = t->_parent ? t->_parent : t;
     if (!r->_surf) return;
+    @synchronized (nvmtl_surface_sync(r)) { r->_readerStreak = 0; }
     if (!cb->_surfOverwrites) cb->_surfOverwrites = [NSMutableSet new];
     [cb->_surfOverwrites addObject:r];
 }
 static BOOL nvmtl_surface_pending_write(NVMTLCommandBuffer *cb, NVMTLTexture *t);
-static void nvmtl_surface_in_for_cb(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
+static BOOL nvmtl_surfin_reader_only(NVMTLTexture *r);
+static void nvmtl_surface_in_for_cb_mode(NVMTLCommandBuffer *cb, NVMTLTexture *t, BOOL renderTargetLoad) {
     if (!t) return;
     NVMTLTexture *r = t->_parent ? t->_parent : t;
     if (cb && r->_surf && [cb->_surfOverwrites containsObject:r]) return;
     // A prior committed buffer defines this GPU backing's contents.
     // Importing the old CPU surface here would run ahead of this buffer and
     // overwrite that earlier GPU write. Queue order or the application's event supplies the dependency.
-    if (nvmtl_surface_pending_write(cb, r)) return;
-    [t nvmtlSurfaceIn];
+    if (nvmtl_surface_pending_write(cb, r)) {
+        if (r->_surf) @synchronized (nvmtl_surface_sync(r)) { r->_readerStreak = 0; }
+        return;
+    }
+    [t nvmtlSurfaceInForRenderTargetLoad:renderTargetLoad];
+}
+static void nvmtl_surface_in_for_cb(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
+    nvmtl_surface_in_for_cb_mode(cb, t, NO);
+}
+static void nvmtl_surface_in_for_render_target(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
+    nvmtl_surface_in_for_cb_mode(cb, t, YES);
 }
 static unsigned nvmtl_surf_id(NVMTLTexture *t) { NVMTLTexture *r = (t && t->_parent) ? t->_parent : t; return (r && r->_surf) ? (unsigned)IOSurfaceGetID(r->_surf) : 0u; }
 static int nvmtl_noseed(void) { static uint64_t next; static int on; uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
@@ -1405,6 +1425,11 @@ unsigned long long nvmtl_tex_objs_live(void) {
     return made > gone ? made - gone : 0;
 }
 unsigned long long nvmtl_tex_objs_released(void) { return nvmtl_tex_objs_gone; }
+@interface NVMTLSurfaceUploadLease : NSObject {
+@public IOSurfaceRef surface; uint32_t options; id pages;
+}
+- (instancetype)initWithSurface:(IOSurfaceRef)surface options:(uint32_t)options pages:(id)pages;
+@end
 @implementation NVMTLTexture
 // sparse textures (NVMTL_SPARSE_TEXTURES=1): where the mip tail starts, how big it is, and whether unmapped tiles read as zero
 - (NSUInteger)firstMipmapInTail { const nvmtl_vk_sparse_info *si = _i.sparse; return si ? si->first_tail : 0; }
@@ -1517,6 +1542,9 @@ void nvmtl_texture_desc_swizzle(NVMTLTexture *t, MTLTextureDescriptor *d) {
         (void *)_surf, (unsigned long)_plane, _i.w, _i.h, _i.bpp, IOSurfaceGetBytesPerElementOfPlane(_surf, (uint32_t)_plane));
     return NO;
 }
+// The plane whose kernel / VRAM-tag / lock state a texture uses: a plane of a multi-plane surface aliased in the whole
+// surface's family VRAM (fork) shares plane 0's, since the VRAM and its page-off cover the whole allocation.
+#define NVMTL_VP(r) ((r)->_vramMulti ? 0 : (r)->_plane)
 // IOSurface locking wires memory and updates its seed; it does not serialize
 // this process's GPU readback and CPU import. Every wrapper of one plane must
 // use the same monitor, including wrappers of shared family VRAM.
@@ -1527,7 +1555,7 @@ static id nvmtl_surface_sync(NVMTLTexture *t) {
         id monitor = objc_getAssociatedObject(t, &key);
         if (!monitor) {
             if (!monitors) monitors = [NSMapTable strongToWeakObjectsMapTable];
-            NSArray *surface = @[@(IOSurfaceGetID(t->_surf)), @(t->_plane)];
+            NSArray *surface = @[@(IOSurfaceGetID(t->_surf)), @(NVMTL_VP(t))];
             monitor = [monitors objectForKey:surface];
             if (!monitor) { monitor = [NSObject new]; [monitors setObject:monitor forKey:surface]; }
             objc_setAssociatedObject(t, &key, monitor, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1536,6 +1564,10 @@ static id nvmtl_surface_sync(NVMTLTexture *t) {
     }
 }
 // NVMTL_SURFIN_UPLOAD=cpu: surface-in copies with the CPU (nvmtl_vk_image_write) instead of importing the pages
+static nvk_buffer *nvmtl_surface_host_pages(NVMTLTexture *r, void *base, size_t bytes);
+static id nvmtl_surface_page_lease(NVMTLTexture *r, nvk_buffer *pages);
+static void *nvmtl_surface_upload_lease_retain(void *lease);
+static void nvmtl_surface_upload_lease_release(void *lease);
 static bool nvmtl_surfin_import(void) {
     static int on = -1;
     if (on < 0) { const char *u = getenv("NVMTL_SURFIN_UPLOAD"); on = !(u && !strcmp(u, "cpu")); }
@@ -1599,15 +1631,47 @@ static uint64_t nvmtl_host_pages_cookie(IOSurfaceRef s)
         if (base && row >= span && rows >= _i.h) { [self nvmtlY422Upload:0 rows:_i.h]; _y422Synced = YES; }
     }
 }
+// Opt-in only: reader locks and CPU edits can advance the seed identically.
+static BOOL nvmtl_surfin_reader_only(NVMTLTexture *r)
+{
+    static int on = -1;
+    if (on < 0) on = nvmtl_reader_skip_opted_in(getenv("NVMTL_SURFIN_READER_SKIP"), getprogname());
+    if (!on || !r->_surfSynced || (r->_vramOn && IOSurfaceGetPlaneCount(r->_surf) > 1)) {
+        r->_readerStreak = 0;
+        return NO;
+    }
+    const uint32_t now = IOSurfaceGetSeed(r->_surf);
+    const BOOL tracked = !r->_vramOn && nvmtl_plane_seed_on();
+    const BOOL sameGen = tracked && nvmtl_vram_gen(r->_surf, r->_plane) == r->_surfGen;
+    BOOL covered = NO;
+    if (sameGen && now != r->_surfSeed && now - 1 != r->_surfSeed) {
+        os_unfair_lock_lock(&g_ps_lock);
+        covered = nvmtl_ps_covers(&g_ps, (uint32_t)IOSurfaceGetID(r->_surf),
+                                  nvmtl_plane_cookie(r->_surf, NO), (uint32_t)r->_plane,
+                                  r->_surfSeed, now - 1, clock_gettime_nsec_np(CLOCK_UPTIME_RAW), 2000000000ull);
+        os_unfair_lock_unlock(&g_ps_lock);
+    }
+    if (!nvmtl_reader_skip_observe(r->_surfSeed, now, &r->_readerStreak, r->_vramOn, tracked, sameGen, covered))
+        return NO;
+    r->_surfSeed = now;
+    if (r->_vramOn) nvmtl_vram_tag_set(r->_surf, r->_plane, now);
+    return YES;
+}
+
 - (void)nvmtlSurfaceIn {
+    [self nvmtlSurfaceInForRenderTargetLoad:NO];
+}
+- (void)nvmtlSurfaceInForRenderTargetLoad:(BOOL)readerSkipCandidate {
     if (_y422Surf) { [self nvmtlY422SurfaceIn]; return; }
     NVMTLTexture *r = _parent ? _parent : self;
     if (!r->_surf) return;
     @synchronized (nvmtl_surface_sync(r)) {
-    if (r->_clientWritten) nvmtl_busy_wait(r->_surf, r->_plane);
+    if (r->_clientWritten) nvmtl_busy_wait(r->_surf, NVMTL_VP(r));
+    if (!r->_clientWritten && nvmtl_busy_foreign(r->_surf, NVMTL_VP(r))) { r->_clientWritten = YES; nvmtl_busy_wait(r->_surf, NVMTL_VP(r)); }
+    if (!readerSkipCandidate || r->_clientWritten) r->_readerStreak = 0;
+    else if (nvmtl_surfin_reader_only(r)) return;
     const uint32_t vgen = r->_vramOn ? 0 : nvmtl_vram_gen(r->_surf, r->_plane);
     if (r->_surfSynced && IOSurfaceGetSeed(r->_surf) == r->_surfSeed && (r->_vramOn || vgen == r->_surfGen)) return;
-    if (!r->_clientWritten && nvmtl_busy_foreign(r->_surf, r->_plane)) { r->_clientWritten = YES; nvmtl_busy_wait(r->_surf, r->_plane); }
     if (r->_surfSynced && !r->_vramOn && vgen == r->_surfGen && nvmtl_plane_seed_on()) {
         // the seed moved, but only through our own surface-outs of other planes: this plane's image is still current
         const uint32_t now = IOSurfaceGetSeed(r->_surf);
@@ -1623,27 +1687,51 @@ static uint64_t nvmtl_host_pages_cookie(IOSurfaceRef s)
     }
     if (![r nvmtlSurfaceCopyable]) return;
     { uint32_t now = IOSurfaceGetSeed(r->_surf);
-      if (r->_vramOn && nvmtl_vram_tag_current(r->_surf, r->_plane, now)) {
+      if (r->_vramOn && nvmtl_vram_tag_current(r->_surf, NVMTL_VP(r), now)) {
           r->_surfSeed = now; r->_surfSynced = YES; g_surfin_skip++;
           static unsigned ns; if (ns++ < 6 || ns % 2000 == 0) nvlog("item 7: surface-in SKIPPED (shared VRAM current at seed %u): %llu skipped, %llu copied", now, g_surfin_skip, g_surfin_copy);
           return; } }
+    if (r->_vramMulti) {   // multi-plane in family VRAM (fork): the whole allocation, all planes, in one copy
+        uint32_t seed = 0;
+        if (IOSurfaceLock(r->_surf, kIOSurfaceLockReadOnly, &seed) != kIOReturnSuccess) { nvlog("multi-plane surface-in: IOSurfaceLock FAILED"); return; }
+        const int rc = nvmtl_vk_buffer_fill_from_surface(r->_q, &r->_vramBuf, IOSurfaceGetBaseAddress(r->_surf), IOSurfaceGetAllocSize(r->_surf));
+        IOSurfaceUnlock(r->_surf, kIOSurfaceLockReadOnly, NULL);
+        if (rc) { nvlog("multi-plane surface-in: upload FAILED (surface %u) - retried at the next use", (unsigned)IOSurfaceGetID(r->_surf)); return; }
+        r->_surfSeed = seed; r->_surfSynced = YES; g_surfin_copy++; nvmtl_vram_tag_set(r->_surf, 0, seed);
+        static unsigned nm; if (nm++ < 6 || nm % 2000 == 0) nvlog("multi-plane surface-in #%u: surface %u (%zu B) seed %u uploaded", nm,
+                                                                (unsigned)IOSurfaceGetID(r->_surf), IOSurfaceGetAllocSize(r->_surf), seed);
+        return;
+    }
     uint32_t seed = 0;
     if (IOSurfaceLock(r->_surf, kIOSurfaceLockReadOnly, &seed) != kIOReturnSuccess) { nvlog("G13 surface-in: IOSurfaceLock FAILED"); return; }
     void *base = IOSurfaceGetBaseAddressOfPlane(r->_surf, (uint32_t)r->_plane);
     size_t row = IOSurfaceGetBytesPerRowOfPlane(r->_surf, (uint32_t)r->_plane);
     int rc = -1;
+    NVMTLSurfaceUploadLease *uploadLease = nil;
     if (base && row && nvmtl_surfin_import()) {
         const size_t off = (size_t)((uint8_t *)base - (uint8_t *)IOSurfaceGetBaseAddress(r->_surf));
-        nvmtl_vk_host_pages_key((uint32_t)IOSurfaceGetID(r->_surf), nvmtl_host_pages_cookie(r->_surf));
-        rc = nvmtl_vk_image_write_host(r->_q, &r->_i, base, row, IOSurfaceGetAllocSize(r->_surf) - off, &r->_hostPages);
-        nvmtl_vk_host_pages_key(0, 0);
+        const size_t bytes = IOSurfaceGetAllocSize(r->_surf) - off;
+        const char *asyncSetting = getenv("NVMTL_SURFIN_ASYNC");
+        if (asyncSetting && !strcmp(asyncSetting, "1")) {
+            nvk_buffer *pages = nvmtl_surface_host_pages(r, base, bytes);
+            id pageLease = nvmtl_surface_page_lease(r, pages);
+            if (pageLease)
+                uploadLease = [[NVMTLSurfaceUploadLease alloc] initWithSurface:r->_surf options:kIOSurfaceLockReadOnly pages:pageLease];
+            rc = nvmtl_vk_image_write_host(r->_q, &r->_i, base, row, bytes, pages, (__bridge void *)uploadLease,
+                                           nvmtl_surface_upload_lease_retain, nvmtl_surface_upload_lease_release);
+        } else {
+            nvmtl_vk_host_pages_key((uint32_t)IOSurfaceGetID(r->_surf), nvmtl_host_pages_cookie(r->_surf));
+            rc = nvmtl_vk_image_write_host(r->_q, &r->_i, base, row, bytes, &r->_hostPages, NULL, NULL, NULL);
+            nvmtl_vk_host_pages_key(0, 0);
+        }
     }
     if (rc) rc = (base && row) ? nvmtl_vk_image_write(r->_q, &r->_i, base, row) : -1;
     if (!rc && r->_i.bpp == 4) { char tag[24]; snprintf(tag, sizeof tag, "in%u-", (unsigned)IOSurfaceGetID(r->_surf)); nvmtl_frame_dump(tag, base, row, r->_i.w, r->_i.h); }
-    IOSurfaceUnlock(r->_surf, kIOSurfaceLockReadOnly, NULL);
+    if (uploadLease) uploadLease = nil; // an async record may keep this lock/lease until its fence completes
+    else IOSurfaceUnlock(r->_surf, kIOSurfaceLockReadOnly, NULL);
     if (rc) { nvlog("G13 surface-in: upload FAILED (%ux%u) — retried at the next use", r->_i.w, r->_i.h); return; }
     r->_surfSeed = seed; r->_surfSynced = YES; r->_surfGen = vgen;
-    g_surfin_copy++; if (r->_vramOn) nvmtl_vram_tag_set(r->_surf, r->_plane, seed);
+    g_surfin_copy++; if (r->_vramOn) nvmtl_vram_tag_set(r->_surf, NVMTL_VP(r), seed);
     static unsigned n; if (n++ < 6 || n % 2000 == 0) nvlog("G13 surface-in #%u: %ux%u surface %p seed %u uploaded", n, r->_i.w, r->_i.h, (void *)r->_surf, seed);
     }
 }
@@ -1662,13 +1750,13 @@ static void nvmtl_surface_remark_later(NVMTLTexture *r, uint32_t seed) {
         for (int i = 0; i < 50 && marked > 0; i++) {
             if (i) usleep(2000);
             if (IOSurfaceGetSeed(r->_surf) != seed) return;
-            marked = nvmtl_vk_surface_dirty_try((uint32_t)IOSurfaceGetID(r->_surf), (uint32_t)r->_plane);
+            marked = nvmtl_vk_surface_dirty_try((uint32_t)IOSurfaceGetID(r->_surf), (uint32_t)NVMTL_VP(r));
         }
         if (marked) return;
         @synchronized (nvmtl_surface_sync(r)) {
             if (r->_surfSeed != seed) return;
             const uint32_t now = IOSurfaceGetSeed(r->_surf);
-            r->_surfSeed = now; r->_surfGen = nvmtl_vram_tag_bump(r->_surf, r->_plane, now);
+            r->_surfSeed = now; r->_surfGen = nvmtl_vram_tag_bump(r->_surf, NVMTL_VP(r), now);
         }
     });
 }
@@ -1678,18 +1766,22 @@ static void nvmtl_surface_remark_later(NVMTLTexture *r, uint32_t seed) {
 // by the same completion thread that would be blocked here. Taken, the commit's mark stands and the re-mark is retried
 // off this thread (nvmtl_surface_remark_later).
 - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied {
+    return [self nvmtlSurfaceOutDirtied:dirtied copied:NO];
+}
+// copied is supplied only by the successfully completed submission that wrote these pages.
+- (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied copied:(BOOL)copied {
     NVMTLTexture *r = _parent ? _parent : self;
     if (!r->_surf) return YES;
     @synchronized (nvmtl_surface_sync(r)) {
     if (![r nvmtlSurfaceCopyable]) { nvtrace("SURFOUT surf %u %ux%u NOT copyable", (unsigned)IOSurfaceGetID(r->_surf), r->_i.w, r->_i.h); return NO; }
     nvtrace("SURFOUT surf %u %ux%u vramOn %d t=%llu", (unsigned)IOSurfaceGetID(r->_surf), r->_i.w, r->_i.h, (int)r->_vramOn,
             (unsigned long long)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000));
-    const int marked = !r->_vramOn ? -1 : dirtied ? nvmtl_vk_surface_dirty_try((uint32_t)IOSurfaceGetID(r->_surf), (uint32_t)r->_plane)
-                                                   : nvmtl_vk_surface_dirty((uint32_t)IOSurfaceGetID(r->_surf), (uint32_t)r->_plane);
+    const int marked = !r->_vramOn ? -1 : dirtied ? nvmtl_vk_surface_dirty_try((uint32_t)IOSurfaceGetID(r->_surf), (uint32_t)NVMTL_VP(r))
+                                                   : nvmtl_vk_surface_dirty((uint32_t)IOSurfaceGetID(r->_surf), (uint32_t)NVMTL_VP(r));
     if (r->_vramOn && (dirtied || !marked)) {
         uint32_t seed = IOSurfaceGetSeed(r->_surf);
         r->_surfSeed = seed; r->_surfSynced = YES;
-        r->_surfGen = nvmtl_vram_tag_bump(r->_surf, r->_plane, seed);
+        r->_surfGen = nvmtl_vram_tag_bump(r->_surf, NVMTL_VP(r), seed);
         if (dirtied && marked > 0) nvmtl_surface_remark_later(r, seed);
         static unsigned nd; if (nd++ < 6 || nd % 5000 == 0) nvlog("surface-out -> dirty, no copy (%ux%u surface %u seed %u, #%u)", r->_i.w, r->_i.h, (unsigned)IOSurfaceGetID(r->_surf), seed, nd);
         return YES;
@@ -1700,8 +1792,8 @@ static void nvmtl_surface_remark_later(NVMTLTexture *r, uint32_t seed) {
     if (IOSurfaceLock(r->_surf, lockopt, &lockSeed) != kIOReturnSuccess) { nvlog("G13 surface-out: IOSurfaceLock FAILED"); return NO; }
     void *base = IOSurfaceGetBaseAddressOfPlane(r->_surf, (uint32_t)r->_plane);
     size_t row = IOSurfaceGetBytesPerRowOfPlane(r->_surf, (uint32_t)r->_plane);
-    int rc = -1;
-    if (base && row && nvmtl_surfout_import()) {
+    int rc = copied ? 0 : -1;
+    if (!copied && base && row && nvmtl_surfout_import()) {
         const size_t off = (size_t)((uint8_t *)base - (uint8_t *)IOSurfaceGetBaseAddress(r->_surf));
         nvmtl_vk_host_pages_key((uint32_t)IOSurfaceGetID(r->_surf), nvmtl_host_pages_cookie(r->_surf));
         rc = nvmtl_vk_image_read_host(r->_q, &r->_i, base, row, IOSurfaceGetAllocSize(r->_surf) - off, &r->_hostPages);
@@ -1719,7 +1811,7 @@ static void nvmtl_surface_remark_later(NVMTLTexture *r, uint32_t seed) {
     if (rc || unlocked != kIOReturnSuccess) { nvlog("G13 surface-out: readback FAILED (%ux%u)", r->_i.w, r->_i.h); return NO; }
     r->_surfSeed = seed; r->_surfSynced = YES;
     r->_surfGen = r->_vramOn ? r->_surfGen : nvmtl_vram_gen(r->_surf, r->_plane);
-    if (r->_vramOn && !lockopt) nvmtl_vram_tag_set(r->_surf, r->_plane, seed);
+    if (r->_vramOn && !lockopt) nvmtl_vram_tag_set(r->_surf, NVMTL_VP(r), seed);
     static unsigned n; if (n++ < 6 || n % 2000 == 0) nvlog("G13 surface-out #%u: %ux%u surface %p seed %u, %.2f ms", n, r->_i.w, r->_i.h,
         (void *)r->_surf, seed, (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0) / 1e6);
     return YES;
@@ -1742,6 +1834,8 @@ static void nvmtl_surface_remark_later(NVMTLTexture *r, uint32_t seed) {
 - (NSUInteger)iosurfacePlane { return _plane; }
 - (MTLStorageMode)storageMode { NVMTLTexture *r = _parent ? _parent : self; if (r->_shareable) return MTLStorageModePrivate;
     NVMTLHeap *hp = r->_heap ? r->_heap : r->_subHeap; return hp ? hp->_storage : (MTLStorageMode)((r->_ropt >> MTLResourceStorageModeShift) & 0xF); }
+// Core Image uses drawable identity to choose screen-oriented output coordinates.
+- (BOOL)isDrawable { return _parent ? [_parent isDrawable] : _drawable; }
 - (BOOL)isFramebufferOnly { NVMTLTexture *r = _parent ? _parent : self; return r->_fbo; }
 - (id<MTLDevice>)device { return (id<MTLDevice>)gNVMTLMainDevice; }
 - (MTLCPUCacheMode)cpuCacheMode { NVMTLTexture *r = _parent ? _parent : self; return nvmtl_res_cache(r->_heap ? r->_heap : r->_subHeap, r->_ropt); }
@@ -3655,6 +3749,7 @@ unsigned nvmtl_apps1_resolve_miss, nvmtl_apps1_resolve_extra, nvmtl_apps1_ds_res
 @end
 
 @interface NVMTLRenderCommandEncoder () { @public BOOL _hzFull; uint32_t _hzAttSkip; } @end   // NVMTL_HAZARD: keeps render passes; untracked attachments
+@interface NVMTLRenderCommandEncoder () { uint32_t _earlyColorClear; } @end
 // Metal does not order an untracked resource between encoders (nvmtl_hazard.h); NVMTL_HAZARD_HEAPS=all tracks everything.
 static int nvmtl_hz_untracked_res(id r) {
     return nvmtl_hz_mode() > 0 && !nvmtl_hz_heaps_all() && [r respondsToSelector:@selector(hazardTrackingMode)] &&
@@ -4102,6 +4197,7 @@ static BOOL nvmtl_pixel_sampler_update(NSMutableDictionary *states, NSString *in
 - (BOOL)nvmtlBuildPass:(MTLRenderPassDescriptor *)d {
     NVMTLCommandBuffer *cb = _cb;
     memset(&_pass, 0, sizeof _pass); cb->_c.depth_view = NULL; _hzAttSkip = 0;
+    _earlyColorClear = 0;
     for (int i = 0; i < NVMTL_NCOL; i++) _colTex[i] = nil;
     _tileW = (uint32_t)NVMTL_SINCE(11.0, NSUInteger, d.tileWidth, 0); _tileH = (uint32_t)NVMTL_SINCE(11.0, NSUInteger, d.tileHeight, 0); _tilePs = nil;
     MTLSamplePosition sample[8];
@@ -4148,6 +4244,14 @@ static BOOL nvmtl_pixel_sampler_update(NSMutableDictionary *states, NSString *in
         _pass.clear[i][0] = ta8 ? (float)cc.alpha : (float)cc.red; _pass.clear[i][1] = (float)cc.green; _pass.clear[i][2] = (float)cc.blue; _pass.clear[i][3] = (float)cc.alpha;
         if (ta8 == 2) { _pass.clear[i][0] = (float)cc.alpha; _pass.clear[i][1] = (float)cc.red; _pass.clear[i][2] = (float)cc.green; _pass.clear[i][3] = (float)cc.blue; }   // ARGB8 stored as RGBA8
         if (nvmtl_load_keeps(ca.loadAction)) load |= NVMTL_LOAD_COLOUR(i);
+        const nvk_image *im = _pass.col[i];
+        const MTLTextureUsage readWriteTarget = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget;
+        if (ca.loadAction == MTLLoadActionClear && t->_surf && !t->_parent && !t->_viewParent && NL == 1 &&
+            t->_fmt == MTLPixelFormatRGBA16Float && (t->_usage & readWriteTarget) == readWriteTarget &&
+            im->mtl_type == MTLTextureType2D && im->samples <= 1 && im->mips == 1 && im->layers == 1 &&
+            !_pass.col_level[i] && !_pass.col_layer[i] && (!tvk || tvk == im->fmt) &&
+            (im->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT))
+            _earlyColorClear |= 1u << i;
         if (cw < w) w = cw;
         if (ch < h) h = ch;
         any = YES;
@@ -4155,7 +4259,8 @@ static BOOL nvmtl_pixel_sampler_update(NSMutableDictionary *states, NSString *in
             [cb->_resources addObject:t];
             NVMTLTexture *sr = t->_parent ? t->_parent : t;
             if (sr->_surf) {
-                if (ca.loadAction == MTLLoadActionClear) nvmtl_surface_overwrite_recorded(cb, sr);
+                if (ca.loadAction == MTLLoadActionClear && !sr->_vramMulti) nvmtl_surface_overwrite_recorded(cb, sr);
+                else if (ca.loadAction == MTLLoadActionLoad) nvmtl_surface_in_for_render_target(cb, sr);
                 else nvmtl_surface_in_for_cb(cb, sr);
                 nvmtl_surf_dirty(cb, sr); }
         }
@@ -4368,6 +4473,15 @@ static MTLPixelFormat nvmtl_swizzle_twin_mtl(MTLPixelFormat f) { return (MTLPixe
     if (nvmtl_hz_mode()) nvmtl_hz_render_writes(_cb, p);
     if (!_begun) {
         if (_refused) return;
+        // RenderBox samples its recycled FP16 colour target, sometimes after the first pipeline was bound.
+        // A render-pass load clear alone can leave old pixels visible through that sampled view. Clear the
+        // backing first for this IOSurface texture shape, then load the cleared pixels into the pass.
+        for (uint32_t pending = _earlyColorClear; pending; pending &= pending - 1) {
+            uint32_t i = (uint32_t)__builtin_ctz(pending), bit = NVMTL_LOAD_COLOUR(i);
+            nvmtl_vk_cmd_clear_image_before_render(&_cb->_c, _pass.col[i], _pass.clear[i]);
+            _pass.load |= bit; _load |= bit;
+        }
+        _earlyColorClear = 0;
         _cb->_c.hz_force_full = _hzFull; _cb->_c.hz_att_skip = _hzAttSkip;
         if (nvmtl_vk_cmd_begin_pass(&_cb->_c, &_pass, &p->_p)) {
             nvlog("encoder: begin render FAILED — nothing is recorded for this pipeline");
@@ -5040,7 +5154,18 @@ static NVMTLBuffer *nvmtl_icb_scratch(uint32_t slots) {
 - (void)useHeap:(id<MTLHeap>)h { nvmtl_use_heap(_cb, h); }
 - (void)useHeap:(id<MTLHeap>)h stages:(MTLRenderStages)st { (void)st; nvmtl_use_heap(_cb, h); }
 - (void)sampleCountersInBuffer:(id)sb atSampleIndex:(NSUInteger)i withBarrier:(BOOL)b { nvmtl_sample_counter(_cb, sb, i, self, b); }
-- (void)textureBarrier { nvmtl_vk_barrier_site(NVMTL_BARS_FENCE_API); nvmtl_vk_cmd_barrier(&_cb->_c); }
+- (void)nvmtlRenderMemoryBarrier {
+    // Metal allows this barrier between draws. A Vulkan subpass only permits barriers
+    // covered by its self-dependency, which does not cover arbitrary texture and buffer accesses.
+    // Store the attachments, issue the full barrier outside the pass and reload them.
+    if (_begun) {
+        [self nvmtlHzRestart:YES];
+        return;
+    }
+    nvmtl_vk_barrier_site(NVMTL_BARS_FENCE_API);
+    nvmtl_vk_cmd_barrier(&_cb->_c);
+}
+- (void)textureBarrier { [self nvmtlRenderMemoryBarrier]; }
 - (void)updateFence:(id<MTLFence>)f afterStages:(MTLRenderStages)st {}
 - (void)waitForFence:(id<MTLFence>)f beforeStages:(MTLRenderStages)st {
     // in a pass begun without a barrier the wait must order what came before the pass: restart it behind one
@@ -5048,8 +5173,12 @@ static NVMTLBuffer *nvmtl_icb_scratch(uint32_t slots) {
     if (nvmtl_hz_mode() == 2) nvmtl_hz_force_full(&_cb->_c, 1);
     nvmtl_vk_barrier_site(NVMTL_BARS_FENCE_API); nvmtl_vk_cmd_barrier(&_cb->_c);
 }
-- (void)memoryBarrierWithScope:(MTLBarrierScope)scope afterStages:(MTLRenderStages)a beforeStages:(MTLRenderStages)b { nvmtl_vk_barrier_site(NVMTL_BARS_FENCE_API); nvmtl_vk_cmd_barrier(&_cb->_c); }
-- (void)memoryBarrierWithResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)n afterStages:(MTLRenderStages)a beforeStages:(MTLRenderStages)b { nvmtl_vk_barrier_site(NVMTL_BARS_FENCE_API); nvmtl_vk_cmd_barrier(&_cb->_c); }
+- (void)memoryBarrierWithScope:(MTLBarrierScope)scope afterStages:(MTLRenderStages)a beforeStages:(MTLRenderStages)b {
+    [self nvmtlRenderMemoryBarrier];
+}
+- (void)memoryBarrierWithResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)n afterStages:(MTLRenderStages)a beforeStages:(MTLRenderStages)b {
+    [self nvmtlRenderMemoryBarrier];
+}
 - (void)drawPrimitives:(MTLPrimitiveType)type indirectBuffer:(id<MTLBuffer>)buf indirectBufferOffset:(NSUInteger)off {
     NVMTLBuffer *nb = (NVMTLBuffer *)buf;
     if (!nb) { nvlog("drawPrimitives:indirectBuffer: nil"); return; }
@@ -7437,6 +7566,7 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
 @end
 
 #pragma mark - command buffer / queue
+#import "NVMTLCapture.m"
 #import "NVMTLEventSync.m"
 @implementation NVMTLCommandBuffer
 // Never a lock on the command buffer itself: apps may hold @synchronized(commandBuffer) around -waitUntilCompleted
@@ -7507,7 +7637,8 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
             (unsigned long)d.colorAttachments[0].storeAction, d.colorAttachments[0].clearColor.red, d.colorAttachments[0].clearColor.green,
             d.colorAttachments[0].clearColor.blue, d.colorAttachments[0].clearColor.alpha, d.depthAttachment.texture != nil);
         if (sr->_surf) {
-            if (d.colorAttachments[0].loadAction == MTLLoadActionClear) nvmtl_surface_overwrite_recorded(self, sr);
+            if (d.colorAttachments[0].loadAction == MTLLoadActionClear && !sr->_vramMulti) nvmtl_surface_overwrite_recorded(self, sr);
+            else if (d.colorAttachments[0].loadAction == MTLLoadActionLoad) nvmtl_surface_in_for_render_target(self, sr);
             else nvmtl_surface_in_for_cb(self, sr);
             nvmtl_surf_dirty(self, sr); } }
     const float defaultBlend[4] = { 0, 0, 0, 0 };

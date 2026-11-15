@@ -92,7 +92,7 @@ stop = ifb[ifb.index("void NMIntelFB::stop(IOService *provider)"):]
 stop = stop[:stop.index("\n}\n")]
 arm("NMIntelFB: stop() uses the same unwind, so the two cannot drift apart", "startUnwind();" in stop)
 # Negative control: the first fix's order (map check after the DMC target and tcStart) must be caught.
-first_fix = subprocess.run(["git", "-C", str(ROOT), "show", "13a9a0bc:kexts/NMIntelFB/intelfb.cpp"],
+first_fix = subprocess.run(["git", "-C", str(ROOT), "show", "06666bf5:kexts/NMIntelFB/intelfb.cpp"],
                            capture_output=True, text=True)
 arm("negative control: the map-after-publish order of the first fix is caught",
     first_fix.returncode == 0 and not map_before_publish(start_bodies(first_fix.stdout, "NMIntelFB")[-1]))

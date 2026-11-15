@@ -148,6 +148,8 @@ uint64_t nvmtl_perf_now(void);
 void nvmtl_perf_note(int what, uint64_t t0, uint64_t bytes);
 int  nvmtl_vk_buffer_import_host(void *ptr, size_t size, nvk_buffer *out);
 size_t nvmtl_vk_host_import_align(void);
+typedef void *(*nvmtl_vk_lease_retain_fn)(void *lease);
+typedef void (*nvmtl_vk_lease_release_fn)(void *lease);
 #define NVMTL_MAX_GEOMS 256
 typedef struct { void *as; uint64_t addr; size_t size; int instance; } nvk_accel;
 typedef struct { uint64_t vertices; uint32_t stride; uint32_t count; uint32_t vertex_format; uint32_t max_vertex;
@@ -228,6 +230,7 @@ int  nvmtl_vk_pipeline_create_vin_ms(const void *vs, size_t vn, const void *fs, 
 void nvmtl_vk_cmd_set_viewport(nvk_cmdbuf *c, float x, float y, float w, float h, float zn, float zf);
 void nvmtl_vk_cmd_draw(nvk_cmdbuf *c, uint32_t first, uint32_t count, uint32_t instances, uint32_t baseInstance);
 int  nvmtl_vk_cmd_clear_image(nvk_cmdbuf *c, nvk_image *img, const float clear[4]);
+void nvmtl_vk_cmd_clear_image_before_render(nvk_cmdbuf *c, nvk_image *img, const float clear[4]);
 void nvmtl_vk_cmd_set_scissor(nvk_cmdbuf *c, int32_t x, int32_t y, uint32_t w, uint32_t h);
 void nvmtl_vk_cmd_set_cull(nvk_cmdbuf *c, int mode);
 int  nvmtl_vk_cmd_set_topology(nvk_cmdbuf *c, unsigned mtlType);
@@ -336,11 +339,15 @@ extern void (*nvmtl_pre_release_hook)(void *);
 extern void (*nvmtl_pre_submit_hook)(void);
 int  nvmtl_vk_image_read(nvk_queue *q, nvk_image *img, void *dst, size_t row_bytes);
 int  nvmtl_vk_image_write(nvk_queue *q, nvk_image *img, const void *src, size_t row_bytes);
-int  nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t row_bytes, size_t bytes, nvk_buffer *cache);
+int  nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t row_bytes, size_t bytes, nvk_buffer *cache,
+                               void *lease, nvmtl_vk_lease_retain_fn retain_lease, nvmtl_vk_lease_release_fn release_lease);
 int  nvmtl_vk_image_read_host(nvk_queue *q, nvk_image *img, void *base, size_t row_bytes, size_t bytes, nvk_buffer *cache);
+int  nvmtl_vk_record_image_to_host(nvk_cmdbuf *c, nvk_image *img, const nvk_buffer *host, size_t offset, size_t row_bytes);
+int  nvmtl_vk_host_pages_hold(void *base, size_t bytes, nvk_buffer *out);
 void nvmtl_vk_host_pages_drop(nvk_buffer *cache);
 /* The surface and cookie the next host-page copy on this thread belongs to (cookie 0 = none): lets wrappers of one surface share an import (NVMTL_HOST_PAGES_SHARE=1). */
 void nvmtl_vk_host_pages_key(uint32_t surface_id, uint64_t cookie);
+int  nvmtl_vk_buffer_fill_from_surface(nvk_queue *q, nvk_buffer *dst, const void *base, size_t bytes);
 int  nvmtl_vk_copy_buffer(nvk_queue *q, nvk_buffer *src, size_t srcOff, nvk_buffer *dst, size_t dstOff, size_t size);
 int  nvmtl_vk_image_create_mips(uint32_t w, uint32_t h, int bgra, uint32_t mips, nvk_image *out);
 int  nvmtl_vk_image_create_ex(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, int a8, uint32_t mips, nvk_image *out);
@@ -498,9 +505,9 @@ int nvmtl_vk_cmd_blit_convert(nvk_cmdbuf *c, nvk_image *src, uint32_t sl, uint32
 void nvmtl_vk_buffer_destroy(nvk_buffer *b);
 int nvmtl_vk_buffer_readback(nvk_buffer *b, size_t off, size_t len, void *dst);
 void nvmtl_vk_image_destroy(nvk_image *i);
-// Finish any in-flight asynchronous texture upload to this image (NVMTL_ASYNC_TEX_UPLOAD) before its memory
-// is read back, migrated or freed. A no-op when none is pending, which is always the case with the flag off.
-void nvmtl_vk_image_upload_barrier(nvk_image *img);
+// Finish in-flight asynchronous uploads before this image is read back, migrated, overwritten or freed. Returns nonzero
+// if the per-image gate cannot be acquired or a fence/backend failure makes the image backing unsafe to touch.
+int nvmtl_vk_image_upload_barrier(nvk_image *img);
 void nvmtl_vk_queue_destroy(nvk_queue *q);
 size_t nvmtl_vk_allocated_bytes(void);
 uint64_t nvmtl_vk_buffer_address(nvk_buffer *b);

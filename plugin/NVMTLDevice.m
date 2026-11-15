@@ -1281,6 +1281,10 @@ static NSData *nvmtl_varying_link(NVMTLFunction *vf, NVMTLFunction *ff) {
               vf->_fname.UTF8String ?: "?", ff->_fname.UTF8String ?: "?", moved, unmatched, told);
     return md;
 }
+static BOOL nvmtl_desc_drawable(MTLTextureDescriptor *d) {
+    SEL selector = sel_registerName("isDrawable");
+    return d && [d respondsToSelector:selector] && ((BOOL (*)(id, SEL))objc_msgSend)(d, selector);
+}
 static BOOL nvmtl_desc_fbo(MTLTextureDescriptor *d) {
     SEL s = sel_registerName("framebufferOnly");
     return d && [d respondsToSelector:s] && ((BOOL (*)(id, SEL))objc_msgSend)(d, s);
@@ -1404,7 +1408,7 @@ static id<MTLTexture> nvmtl_make_y422_texture(MTLTextureDescriptor *d, NVMTLText
     NVMTLTexture *t = [NVMTLTexture new];
     t->_ropt = (MTLResourceOptions)d.cpuCacheMode | ((MTLResourceOptions)NVMTL_SINCE(10.15, NSUInteger, d.hazardTrackingMode, 0) << MTLResourceHazardTrackingModeShift)
              | ((MTLResourceOptions)d.storageMode << MTLResourceStorageModeShift);
-    t->_fbo = nvmtl_desc_fbo(d);
+    t->_fbo = nvmtl_desc_fbo(d); t->_drawable = nvmtl_desc_drawable(d);
     t->_fmt = d.pixelFormat;
     uint32_t dvk = 0, dasp = 0;
     if (nvmtl_depthfmt(d.pixelFormat, &dvk, &dasp) == 0) {
@@ -1604,9 +1608,62 @@ static int nvmtl_ic_put(nvk_buffer *b)
     if (r) memset(b, 0, sizeof *b);
     return r != 0;
 }
+
+// Experimental: opt in only with the accelerator's unlocked page-off wait available.
+// Otherwise keep the existing private images for capture planes.
+static int nvmtl_mp_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("NVMTL_SURF_MULTIPLANE");
+        int unlocked = 0; size_t len = sizeof unlocked;
+        on = e && !strcmp(e, "1")
+            && !sysctlbyname("debug.nvaccel_pageoff_unlocked_wait", &unlocked, &len, NULL, 0)
+            && len == sizeof unlocked && unlocked == 1;
+        nvlog("multi-plane IOSurfaces %s (NVMTL_SURF_MULTIPLANE=%s)", on ? "share the family VRAM" : "use private images", e ?: "unset");
+    }
+    return on;
+}
+static int nvmtl_mp_plane_range(uintptr_t base, uintptr_t plane, size_t alloc,
+                                uint32_t w, uint32_t h, size_t bpp, size_t pitch,
+                                size_t planeHeight, size_t *offset)
+{
+    if (!base || plane < base || !w || !h || !bpp || !pitch || h > planeHeight
+        || pitch % 32 || w > SIZE_MAX / bpp) return 0;
+    const size_t off = plane - base, row = (size_t)w * bpp;
+    if (off % 32 || off > alloc || row > pitch || row > alloc - off
+        || (size_t)(h - 1) > (alloc - off - row) / pitch) return 0;
+    *offset = off;
+    return 1;
+}
 static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInteger plane, uint32_t w, uint32_t h,
                                       uint32_t vkf, uint32_t bpp, int a8, int stex)
 {
+    if (surf && IOSurfaceGetPlaneCount(surf) > 1 && plane < IOSurfaceGetPlaneCount(surf) && nvmtl_vk_surface_share_on() && nvmtl_mp_on()) {
+        // Multi-plane surface (fork): plane 0's family VRAM mirrors the whole IOSurface allocation (checked: NV12 1080p /
+        // 4K / 720p import with the allocation size), and the kernel pages the whole allocation off. Each plane's image is
+        // a linear alias at the plane's offset and pitch in one import of the whole surface; kernel marks and VRAM tags
+        // use plane 0, and the whole allocation is uploaded at once (nvmtl_mp_upload) so VRAM never holds a stale plane.
+        const size_t alloc = IOSurfaceGetAllocSize(surf), prow = IOSurfaceGetBytesPerRowOfPlane(surf, plane);
+        size_t off = 0;
+        if (nvmtl_mp_plane_range((uintptr_t)IOSurfaceGetBaseAddress(surf),
+                (uintptr_t)IOSurfaceGetBaseAddressOfPlane(surf, plane), alloc, w, h, bpp ? bpp : 4,
+                prow, IOSurfaceGetHeightOfPlane(surf, plane), &off)) {
+            nvk_buffer vb;
+            if (!nvmtl_ic_get(surf, alloc, &vb)) {
+                if (!nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, stex, 1, &vb, off, prow, &t->_i)) {
+                    t->_vramBuf = vb; t->_vramOn = YES; t->_vramMulti = YES; g_surf_vram++;
+                    uint32_t seed = IOSurfaceGetSeed(surf);
+                    if (nvmtl_vram_tag_current(surf, 0, seed)) { t->_surfSeed = seed; t->_surfSynced = YES; }
+                    static unsigned n; if (n++ < 8 || n % 2000 == 0)
+                        nvlog("multi-plane: surface %u plane %lu %ux%u at %zu pitch %zu -> the family's VRAM (%zu B surface)", (unsigned)IOSurfaceGetID(surf),
+                              (unsigned long)plane, w, h, off, prow, alloc);
+                    return 0;
+                }
+                if (!nvmtl_ic_put(&vb)) nvmtl_vk_buffer_destroy(&vb);
+            }
+        }
+    }
     if (surf && plane == 0 && IOSurfaceGetPlaneCount(surf) <= 1 && nvmtl_vk_surface_share_on()) {
         size_t row = IOSurfaceGetBytesPerRow(surf), sh = IOSurfaceGetHeight(surf);
         if ((size_t)w * (bpp ? bpp : 4) <= row && h <= sh && row % 32 == 0) {
@@ -1641,21 +1698,30 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
     return nvmtl_vk_image_create_typed(w, h, vkf, bpp, a8, 1, stex, 2u, 1u, &t->_i);
 }
 
+static BOOL nvmtl_surface_can_shader_write(NVMTLTexture *texture) {
+    if (texture->_stex) return YES;
+    nvk_image *image = [texture nvi];
+    // nvmtl_storage_view_for can write a linear surface through an optimal-tiled
+    // twin. Its eligibility also determines the capability Core Image sees.
+    if (texture->_parent || !image || !image->img || !image->w || !image->h
+        || (image->mips ? image->mips : 1) > 1 || (image->layers ? image->layers : 1) > 1
+        || image->mtl_type != 2 || (image->samples ? image->samples : 1) > 1 || image->bw > 1) return NO;
+    return nvmtl_vk_format_is_storage(nvmtl_vk_srgb_format(image->fmt) ? VK_FORMAT_R16G16B16A16_SFLOAT : image->fmt) != 0;
+}
+
 // A CAMetalLayer drawable with framebufferOnly=NO is, on real Metal, usable as a render target AND a compute/Core Image
 // destination. QuartzCore hands this driver a descriptor whose usage is only ShaderRead for it, so Core Image refuses the
 // texture ("texture usage must include MTLTextureUsageShaderWrite") and Photo Booth's preview stays black. The surface's
 // image is already writable whenever its format allows (see nvmtl_surface_image_create), so say so.
 // WindowServer keeps the usage it asked for: it wraps hundreds of surfaces a second, none of them Core Image targets.
-static NSUInteger nvmtl_surface_usage(NSUInteger usage, BOOL fbo, BOOL storage) {
-    // Unknown permits shader writes too. Adding only ShaderRead/RenderTarget to a
-    // non-storage surface would forbid its optimal-tiled storage twin below
-    // (ImageIO's RGBA16Unorm outputs), silently sending those writes to a dummy.
+static NSUInteger nvmtl_surface_usage(NSUInteger usage, BOOL fbo, BOOL writable) {
+    // Unknown already permits shader writes, including the storage-twin path.
     if (usage == MTLTextureUsageUnknown) return usage;
     static int ws = -1;
     if (ws < 0) { const char *me = getprogname(); ws = me && !strcmp(me, "WindowServer"); }
     if (!fbo && !ws) {
         usage |= MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
-        if (storage) usage |= MTLTextureUsageShaderWrite;
+        if (writable) usage |= MTLTextureUsageShaderWrite;
     }
     return usage;
 }
@@ -1677,7 +1743,7 @@ static char nvmtl_surface_cache_key;
     NVMTLTexture *t = [NVMTLTexture new];
     t->_ropt = (MTLResourceOptions)d.cpuCacheMode | ((MTLResourceOptions)NVMTL_SINCE(10.15, NSUInteger, d.hazardTrackingMode, 0) << MTLResourceHazardTrackingModeShift)
              | ((MTLResourceOptions)d.storageMode << MTLResourceStorageModeShift);
-    t->_fbo = nvmtl_desc_fbo(d);
+    t->_fbo = nvmtl_desc_fbo(d); t->_drawable = nvmtl_desc_drawable(d);
     t->_fmt = d.pixelFormat;
     if (nvmtl_y422_is_format((uint32_t)d.pixelFormat)) {   // a video frame: decoded on use, never cached or written back
         if (!surf || w != IOSurfaceGetWidthOfPlane(surf, (uint32_t)plane) || h != IOSurfaceGetHeightOfPlane(surf, (uint32_t)plane)) { nvlog("4:2:2 texture over an IOSurface plane: size mismatch or no surface - nil"); return nil; }
@@ -1688,7 +1754,7 @@ static char nvmtl_surface_cache_key;
     uint32_t vkf = 0, bpp = 0; int a8 = 0;
     if (nvmtl_pixfmt(d.pixelFormat, &vkf, &bpp, &a8)) return nil;
     int wantStex = (d.usage & MTLTextureUsageShaderWrite) != 0;
-    NSArray *key = surf ? @[@(IOSurfaceGetID(surf)), @(plane), @(w), @(h), @(d.pixelFormat), @(t->_ropt), @(t->_fbo)] : nil;
+    NSArray *key = surf ? @[@(IOSurfaceGetID(surf)), @(plane), @(w), @(h), @(d.pixelFormat), @(t->_ropt), @(t->_fbo), @(t->_drawable)] : nil;
     NVMTLTexture *backing = key ? [cache objectForKey:key] : nil;
     // Failed BAR imports use a private image. Repeated wrappers of the same
     // surface must share that image, just as successful family imports do,
@@ -1697,7 +1763,7 @@ static char nvmtl_surface_cache_key;
     if (backing && !backing->_vramOn) {
         NVMTLTexture *alias = (NVMTLTexture *)[backing newTextureViewWithPixelFormat:d.pixelFormat];
         if (alias) {
-            alias->_viewParent = nil; alias->_usage = nvmtl_surface_usage(d.usage, t->_fbo, alias->_stex); alias->_ropt = t->_ropt; alias->_fbo = t->_fbo;
+            alias->_viewParent = nil; alias->_usage = nvmtl_surface_usage(d.usage, t->_fbo, nvmtl_surface_can_shader_write(alias)); alias->_ropt = t->_ropt; alias->_fbo = t->_fbo;
             nvmtl_texture_desc_swizzle(alias, d);
             return alias;
         }
@@ -1705,11 +1771,11 @@ static char nvmtl_surface_cache_key;
     if (nvmtl_surface_image_create(t, surf, plane, (uint32_t)w, (uint32_t)h, vkf, bpp, a8, wantStex)) {
         nvlog("newTextureWithDescriptor:iosurface:plane: image create FAILED (%zux%zu)", w, h); return nil; }
     t->_q = nvmtl_device_queue();
-    t->_surf = surf; if (surf) { CFRetain(surf); t->_surfOwned = YES; t->_clientWritten = nvmtl_busy_foreign(surf, plane) != 0; }
+    t->_surf = surf; if (surf) { CFRetain(surf); t->_surfOwned = YES; t->_clientWritten = nvmtl_busy_foreign(surf, t->_vramMulti ? 0 : plane) != 0; }
     t->_plane = plane;
     t->_fmt = d.pixelFormat;
     t->_stex = t->_i.storage == 1;
-    t->_usage = nvmtl_surface_usage(d.usage, t->_fbo, t->_stex);
+    t->_usage = nvmtl_surface_usage(d.usage, t->_fbo, nvmtl_surface_can_shader_write(t));
     nvmtl_texture_desc_swizzle(t, d);
     if (key && !t->_vramOn) [cache setObject:t forKey:key];
     nvlog("newTextureWithDescriptor:iosurface:%p plane:%lu -> %p (%zux%zu fmt %lu)",

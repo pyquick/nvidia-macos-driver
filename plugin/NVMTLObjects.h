@@ -53,9 +53,12 @@ static inline void *nvmtl_buf_cpu(NVMTLBuffer *b) { nvmtl_buf_settle(b); if (b->
   NVMTLTexture *_viewParent;
   uint32_t _viewType, _viewSlices, _relativeLevel, _relativeSlice;
   uint32_t _baseSlice, _baseLevel;
-  uint32_t _surfSeed, _surfGen; BOOL _surfSynced, _surfOwned;
+  uint32_t _surfSeed, _surfGen, _readerStreak; BOOL _surfSynced, _surfOwned;
   nvk_buffer _vramBuf; BOOL _vramOn;
   nvk_buffer _hostPages;   // this surface's pages imported for the host copies (nvmtl_host_pages), kept while they hold
+  id _hostPageLease;      // shared across wrappers; async upload records hold their own page/surface lease
+  id _capturePages;       // each recorded copy also retains its import until that submission finishes
+  BOOL _vramMulti;   // fork: one plane of a multi-plane surface aliased in the whole surface's family VRAM (kernel / tag state: plane 0)
   BOOL _stex;
   uint64_t _resid;
   NSUInteger _usage;
@@ -65,8 +68,13 @@ static inline void *nvmtl_buf_cpu(NVMTLBuffer *b) { nvmtl_buf_settle(b); if (b->
 - (void *)nvview;
 - (void *)nvsampleview;
 - (void)nvmtlSurfaceIn;
+- (void)nvmtlSurfaceInForRenderTargetLoad:(BOOL)readerSkipCandidate;
 - (BOOL)nvmtlSurfaceOut;
 - (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied;
+- (BOOL)nvmtlSurfaceOutDirtied:(BOOL)dirtied copied:(BOOL)copied;
+@end
+@interface NVMTLTexture (CaptureCopyout)
+- (id)nvmtlRecordCaptureCopy:(nvk_cmdbuf *)commands;
 @end
 @interface NVMTLFunction : NSObject <MTLFunction> { @public NSData *_spirv; NSString *_fname; NSString *_stage; NSString *_air; NSDictionary *_fc; NSArray *_embedded; unsigned char _bcHash[32]; BOOL _bcHashed;
   NSDictionary *_refl; NSDictionary *_airNames; NSArray *_arguments;
@@ -280,7 +288,7 @@ id<MTLCounterSet> nvmtl_timestamp_counter_set(void);
   uint64_t _useEp;
   BOOL _texSeen;
 } @end
-@interface NVMTLTexture () { @public NSString *_label; MTLResourceOptions _ropt; BOOL _shareable; BOOL _fbo;
+@interface NVMTLTexture () { @public NSString *_label; MTLResourceOptions _ropt; BOOL _shareable; BOOL _fbo; BOOL _drawable;
   MTLTextureSwizzleChannels _swz; BOOL _hasSwz; void *_swzView;
   void *_tbView, *_tbAlias; BOOL _tbStorage;
   int _resRefs;

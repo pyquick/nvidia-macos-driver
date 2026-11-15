@@ -76,4 +76,5 @@ cp "$SRC/Info.plist" "$OUT/NVRM.kext/Contents/Info.plist"
 xcrun nm -u "$OUT/NVRM.kext/Contents/MacOS/NVRM" > "$OUT/imports.txt"
 xcrun nm "$OUT/NVRM.kext/Contents/MacOS/NVRM" > "$OUT/symbols.txt"
 xcrun strip -S "$OUT/NVRM.kext/Contents/MacOS/NVRM"
+bash "$HERE/check_kext_libraries.sh" "$OUT/NVRM.kext" || exit 4
 echo "NVRM $(shasum -a 256 "$OUT/NVRM.kext/Contents/MacOS/NVRM" | cut -c1-16) $(stat -f %z "$OUT/NVRM.kext/Contents/MacOS/NVRM") B uuid $(xcrun otool -l "$OUT/NVRM.kext/Contents/MacOS/NVRM" | awk '/LC_UUID/{getline; getline; print $2; exit}') from $(git -C "$SRC" rev-parse --short HEAD 2>/dev/null || echo "$SRC")"

@@ -1,4 +1,26 @@
-# NullMoth NVIDIA Driver for macOS
+# GeekAudio NullMoth NVIDIA 驱动
+
+基于 [NullMoth 官方驱动](https://github.com/nullmoth/nvidia-macos-driver) 的 GeekAudio 整合版，适用于 Intel／OpenCore x86_64 的 macOS 15 和 26。每个版本在所选官方基线上累计保留 GeekAudio 仍需维护的功能与修复，随同一个完整安装包交付。
+
+## 下载与安装
+
+从 [GeekAudio 正式版](https://github.com/GeekAudio/nvidia-macos-driver/releases/latest) 下载完整安装包或更新 App。App 可通过 GitHub 直连或代理检查更新，校验签名后下载同一份整包，并请求 macOS 管理员授权。
+
+手动安装时，用发行页的 SHA-256 清单校验完整包，解压后进入 `pkgroot` 运行 `sudo ./install.sh`，安装结束后重启。完整包包含官方驱动基线，安装器会按原流程校验并获取需要的 NVIDIA 固件。
+
+## 当前正式版包含的改进
+
+- RTX 30（GA10x C7B0）在适用进程默认注册 NVDEC H.264 与 HEVC（`hvc1`）快速硬解，并由解码会话报告实际 PCI 设备。在 RTX 3080、macOS 26.7.3 上，1080p H.264 和 HEVC 各完成 4,500 帧，零错误。
+- 沿用官方对 RTX 40（Ada）的 NVEncVT 注册策略。4060 的硬解实机问题仍待复测。
+- 整包包含可选的 Firefox VP9／AV1 注入启动脚本。安装驱动并完全退出 Firefox 后，从解压目录运行 `bash pkgroot/extras/firefox-nvdec.sh`。
+- 保留 Photo Booth 预览方向与 Core Image 写入修复，以及可选的 IOSurface 与 NV12 录屏适配。实验路径按发行说明的开关启用。
+- 外接屏通过官方 DDC/CI 通道 `nvrmfbddc=1` 接入 macOS 原生亮度滑块，已在一台 DP 和一台 HDMI 显示器上验证亮度写入及回读。
+
+[累计发布规则与功能清单](docs/GEEKAUDIO-RELEASES.md) · [更新 App 构建与签名](tools/ReleaseChecker/README.md)
+
+## NullMoth 上游资料
+
+以下英文资料来自上游，介绍官方驱动、硬件支持和 1401 安装方式。GeekAudio 整合版的下载使用上面的正式版入口。
 
 A Metal driver for NVIDIA GeForce cards on macOS 15 Sequoia (Intel Macs and OpenCore PCs). It is open source; the
 kernel extensions, the Metal plugin and the shader translator are in this repository. The 1401 app that installs it

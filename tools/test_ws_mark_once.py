@@ -26,7 +26,7 @@ typedef struct { uint32_t id; } Surf;
 static uint32_t IOSurfaceGetID(Surf *s) { return s->id; }
 static unsigned calls, errors, checks; static int refuse_id;
 static int nvmtl_vk_surface_dirty(uint32_t sid, uint32_t plane) { calls++; return (int)sid == refuse_id ? -1 : 0; }
-@interface NVMTLTexture : NSObject { @public Surf *_surf; BOOL _vramOn; NSUInteger _plane; } @end
+@interface NVMTLTexture : NSObject { @public Surf *_surf; BOOL _vramOn, _vramMulti; NSUInteger _plane; } @end
 @implementation NVMTLTexture @end
 @interface NVMTLSubmissionPart : NSObject { @public NSSet *surfaces; } @end
 @implementation NVMTLSubmissionPart @end
@@ -42,22 +42,23 @@ static NVMTLTexture *tex(Surf *s, NSUInteger plane) { NVMTLTexture *t = [NVMTLTe
 int main(void) { @autoreleasepool {
     Surf video = { 7 }, desk = { 9 }, other = { 11 };
     NVMTLTexture *v0 = tex(&video, 0), *v0view = tex(&video, 0), *v1 = tex(&video, 1), *d = tex(&desk, 0);
+    NVMTLTexture *multi = tex(&video, 1); multi->_vramMulti = YES;
     NVMTLTexture *off = tex(&other, 0); off->_vramOn = NO;
     CB *cb = [CB new]; cb->_parts = [NSMutableArray new];
     for (int p = 0; p < 4; p++) { NVMTLSubmissionPart *part = [NVMTLSubmissionPart new];
-        part->surfaces = [NSSet setWithObjects:v0, v0view, v1, d, off, nil]; [cb->_parts addObject:part]; }
+        part->surfaces = [NSSet setWithObjects:v0, v0view, v1, multi, d, off, nil]; [cb->_parts addObject:part]; }
     [cb->_parts addObject:[NSNull null]];
     Holds *h = [Holds new]; h->early = YES;
     run(cb, h);
     check(calls == 3, "4 parts x 4 VRAM textures over 3 surface planes: 3 kernel marks, not 16");
-    check([h->dirtied containsObject:v0] && [h->dirtied containsObject:v0view] && [h->dirtied containsObject:v1] && [h->dirtied containsObject:d],
+    check([h->dirtied containsObject:v0] && [h->dirtied containsObject:v0view] && [h->dirtied containsObject:v1] && [h->dirtied containsObject:d] && [h->dirtied containsObject:multi],
           "every texture of a marked plane is still recorded as dirtied (its completion re-mark is a try)");
     check(![h->dirtied containsObject:off], "a texture without shared VRAM is neither marked nor recorded");
     calls = 0; refuse_id = 7; h = [Holds new]; h->early = YES;
     run(cb, h);
     check(calls == 3 && ![h->dirtied containsObject:v0] && ![h->dirtied containsObject:v0view] && ![h->dirtied containsObject:v1],
           "a refused mark is asked once and its textures are not recorded as dirtied (they take the copy-out)");
-    check([h->dirtied containsObject:d], "negative control: another surface in the same command buffer is still marked");
+    check([h->dirtied containsObject:d] && ![h->dirtied containsObject:multi], "negative control: another surface in the same command buffer is still marked");
     calls = 0; refuse_id = 0;
     CB *two = [CB new]; two->_parts = [NSMutableArray arrayWithObject:cb->_parts[0]];
     run(two, [Holds new]); run(two, [Holds new]);

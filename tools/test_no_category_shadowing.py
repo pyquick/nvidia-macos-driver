@@ -57,13 +57,13 @@ for b in bad[:20]:
     print("     " + b)
 fails += bool(bad)
 # calibration: the NVMTLGL.m from before the fix must be caught, or a zero above proves nothing
-old = subprocess.run(["git", "-C", str(ROOT), "show", "c6619e54:plugin/NVMTLGL.m"], capture_output=True, text=True)
+old = subprocess.run(["git", "-C", str(ROOT), "show", "ed56d670^:plugin/NVMTLGL.m"], capture_output=True, text=True)
 if old.returncode == 0:
     texts = [t for t in tree(PLUGIN) if t[0] != "NVMTLGL.m"] + [("NVMTLGL.m", old.stdout)]
     hits = [b for b in shadowed(texts) if "dispatchThreadsPerTile" in b or "setTileBuffer:offset:atIndex:" in b]
     print(("ok   " if len(hits) == 2 else "FAIL ") + f"control: the old stubs are caught ({len(hits)} of the 2 named)")
     fails += len(hits) != 2
 else:
-    print("UNKNOWN control: c6619e54 not in this checkout"); fails += 1
+    print("UNKNOWN control: ed56d670^ not in this checkout"); fails += 1
 print("FAILED %d" % fails if fails else "PASS all arms")
 sys.exit(1 if fails else 0)

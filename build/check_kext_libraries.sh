@@ -3,7 +3,7 @@
 # Info.plist (OSBundleLibraries). Without the entry the kernel linker leaves the family's symbols unresolved and the kext
 # never loads, on every machine; the build and the link both succeed, so nothing else shows it. The keyboard backlight
 # plugin subclasses IOHIDDevice and had no IOHIDFamily entry. Checked from the import table, not the source: including a
-# family's header for a constant needs no entry. Exit 1 naming each missing library.
+# family's header for a constant needs no entry. Also reject known compiler-generated imports unavailable on XNU.
 set -uo pipefail
 # imported class prefix (regex) -> the bundle identifier(s), any one of which satisfies it
 TABLE='IOHIDDevice|IOHIDInterface|IOHIDEvent:com.apple.iokit.IOHIDFamily
@@ -20,6 +20,10 @@ for K in "$@"; do
   libs=" $(plutil -extract OSBundleLibraries xml1 -o - "$p" 2>/dev/null | sed -n 's|.*<key>\(.*\)</key>.*|\1|p' | tr '\n' ' ')"
   und=$(nm -arch x86_64 -u "$b" 2>/dev/null) || { echo "STOP: nm could not read $b"; fail=1; continue; }
   [ -n "$und" ] || { echo "STOP: $b imports nothing (not a kext binary?)"; fail=1; continue; }
+  if grep -Fxq '___x86_return_thunk' <<< "$und"; then
+    echo "STOP: $n imports ___x86_return_thunk, which XNU does not export; rebuild without -mfunction-return=thunk-extern"
+    fail=1
+  fi
   while IFS=: read -r pat ids; do
     printf '%s\n' "$und" | grep -Eq "__Z(N|NK|TV)[0-9]+($pat)" || continue
     ok=0; for id in $(printf '%s' "$ids" | tr '|' ' '); do case "$libs" in *" $id "*) ok=1;; esac; done
